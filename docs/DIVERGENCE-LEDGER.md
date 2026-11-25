@@ -48,6 +48,24 @@ differences in `-ssh`. Each will get its own entry below.
 | E2-07 | `mitm` | GUI | `MitmState::from_pem_bytes` loads a CA from memory, so a vaulted CA no longer has to be staged in a temporary file. File loading is unchanged. | keep | E2 |
 | E2-08 | `router::condition` | all | The default-on `routing` cargo feature gates the `regex` dependency. With `--no-default-features`, the regex-based conditions (`host_wildcard`, `host_regex`, `url_wildcard`, `url_regex`, and wildcard `bypass` hosts) fail to compile and return a `ConditionError` that names the feature. All other conditions and modules keep working. Default builds are unchanged. | option | E2 (`src/router/condition.rs`) |
 
-## E3–E4 (to be filled)
+## E3 — Port `rusty-conduit`
 
-Entries for `rusty-conduit` (E3) and `rusty-conduit-ssh` (E4) are added here as each port finds them.
+`rusty-conduit` v1.2.0 (`db2c82a`) was ported onto `rusty-conduit-engine` (`default-features = false`) on `feat/one-engine` (`f5fbce5`). All 71 tests pass with zero assertion changes and byte-identical `--help` output.
+
+| ID | Module | Consumers | Difference | Decision | Landed |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| E3-01 | `logging` | `rusty-conduit` | The engine emits `rule`, `profile`, and `upstream` fields by default; `rusty-conduit` v1.2.0 did not. Added `AccessLogConfig::with_routing_fields(false)` / `AccessLogger::with_routing_fields(false)` so `rusty-conduit` keeps its exact v1.2.0 text and JSON schemas. | option | E3 (`src/logging.rs`, `bb884a2`) |
+| E3-02 | `filter`, `upstream::direct` | `rusty-conduit` | `Router::route_with` runs `HostFilter::check_host` without DNS (required for remote-DNS proxied upstreams). `rusty-conduit` passes `RoutingInput.filter = None` and installs its `HostFilter` on `DialerOptions` (`DirectDialer`) so IP/CIDR-only allowlists continue checking resolved IPs at dial time. | option | E3 (`f5fbce5`) |
+| E3-03 | `http`, `socks` | `rusty-conduit` | Bad `CONNECT` target `400` body changed from `invalid CONNECT target` to `CONNECT target must be host:port`; diagnostic `ERROR`/`INFO`/`DEBUG` wording now uses the engine's unified format. HTTP status codes (`403`/`502`/`504`) and SOCKS reply codes are unchanged. | keep | E3 (`f5fbce5`) |
+| E3-04 | `server`, `mitm` | `rusty-conduit` | Engine defaults (`max_connections = 1024`, `mitm_cert_cache_max = 4096`) differ from `rusty-conduit`'s (`4096`, `10_000`); `rusty-conduit` passes its own values explicitly via `ServerOptions` / `MitmOptions`. Inherits E2 CA-loader fixes (`E2-01`, `E2-02`). | option / fix | E3 (`f5fbce5`) |
+
+## E4 — Port `rusty-conduit-ssh`
+
+`rusty-conduit-ssh` v1.3.0 (`88bbe0c`) was ported onto `rusty-conduit-engine` (`default-features = false`) on `feat/one-engine` (`7b6daa4`). All 141 tests pass (including reconnect and reverse-proxy tests) with zero assertion changes and byte-identical `--help` and error exit codes.
+
+| ID | Module | Consumers | Difference | Decision | Landed |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| E4-01 | `logging` | `-ssh` | `-ssh` tags every access record with `direction=forward\|reverse` right after `kind=` and omits `rule`/`profile`/`upstream`. Added `ProxyDirection` and `AccessLogger::with_direction(...)` alongside `with_routing_fields(false)` so forward and reverse servers share one writer while keeping the exact v1.3.0 log schema. | option | E4 (`src/logging.rs`, `bb884a2`) |
+| E4-02 | `net`, `upstream` | `-ssh` | `-ssh` keeps `TunnelState` and `Socks5UpstreamDialer` in a thin `src/net.rs`, implementing `rusty_conduit_engine::upstream::UpstreamDialer` (`UpstreamStream::Tcp`, typed `DialError::NotConnected`/`Timeout`) and registering it as an API-only `ProfileType::External` profile (`ssh-tunnel`). Forward `HostFilter` runs in the router without local DNS, matching former `FilteredDialer`. | keep | E4 (`7b6daa4`) |
+| E4-03 | `reverse`, `server`, `filter` | `-ssh` | `ReverseProxy` is rebuilt as a second engine `Server` with a direct-egress `RoutingState` and its reverse `HostFilter` passed via `DialerOptions` only (so IP/CIDR-only allowlists check resolved IPs at dial time, verified by `reverse_filter_checks_resolved_ips_for_hostnames`). | keep | E4 (`7b6daa4`) |
+| E4-04 | `http`, `socks`, `mitm` | `-ssh` | Status/reply mapping now flows through typed `DialError` with identical HTTP (`403`/`502`/`504`) and SOCKS (`0x01`–`0x05`) codes; `MitmState` dials through routing instead of taking a dialer directly. Inherits E2 CA-loader fixes (`E2-01`, `E2-02`). | keep / fix | E4 (`7b6daa4`) |
