@@ -308,6 +308,7 @@ impl RequestCtx {
             self.tasks.clone(),
             HttpAccessRecord {
                 ts: OffsetDateTime::now_utc(),
+                direction: None,
                 client: self.peer,
                 proto: proto.to_string(),
                 mitm,

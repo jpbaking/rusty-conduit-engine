@@ -564,6 +564,7 @@ fn new_guard(
         tasks.clone(),
         HttpAccessRecord {
             ts: OffsetDateTime::now_utc(),
+            direction: None,
             client,
             proto: "https".into(),
             mitm: true,

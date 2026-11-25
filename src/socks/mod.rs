@@ -503,6 +503,7 @@ impl Session {
         }
         let record = SocksLogRecord {
             ts: self.ts,
+            direction: None,
             client: self.client,
             proto: self.proto.into(),
             cmd: self.cmd,

@@ -218,6 +218,29 @@ impl Logger {
 // Access records
 // ---------------------------------------------------------------------------
 
+/// Optional traffic direction tag emitted right after `kind=` in access logs (used by
+/// consumers that run both forward and reverse listeners, such as `rusty-conduit-ssh`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProxyDirection {
+    Forward,
+    Reverse,
+}
+
+impl ProxyDirection {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Reverse => "reverse",
+        }
+    }
+}
+
+impl fmt::Display for ProxyDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One HTTP/HTTPS access log entry (`kind=http`).
 ///
 /// `rule`, `profile`, and `upstream` carry the routing decision that served the request;
@@ -225,6 +248,8 @@ impl Logger {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpAccessRecord {
     pub ts: OffsetDateTime,
+    /// Optional direction tag (`forward` / `reverse`), omitted when `None`.
+    pub direction: Option<ProxyDirection>,
     pub client: SocketAddr,
     /// `http` or `https`.
     pub proto: String,
@@ -250,6 +275,8 @@ pub struct HttpAccessRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocksLogRecord {
     pub ts: OffsetDateTime,
+    /// Optional direction tag (`forward` / `reverse`), omitted when `None`.
+    pub direction: Option<ProxyDirection>,
     pub client: SocketAddr,
     /// `socks4`, `socks4a`, or `socks5`.
     pub proto: String,
@@ -316,11 +343,24 @@ impl AccessRecord {
         }
     }
 
+    /// Optional traffic direction tag (`forward` / `reverse`).
+    pub fn direction(&self) -> Option<ProxyDirection> {
+        match self {
+            AccessRecord::Http(r) => r.direction,
+            AccessRecord::Socks(r) => r.direction,
+        }
+    }
+
     /// Encode as one line (without trailing newline), exactly as the file sinks write it.
     pub fn format(&self, format: LogFormat) -> String {
+        self.format_with(format, true)
+    }
+
+    /// Encode as one line, optionally omitting the routing fields (`rule`, `profile`, `upstream`).
+    pub fn format_with(&self, format: LogFormat, include_routing_fields: bool) -> String {
         match self {
-            AccessRecord::Http(r) => r.format(format),
-            AccessRecord::Socks(r) => r.format(format),
+            AccessRecord::Http(r) => r.format_with(format, include_routing_fields),
+            AccessRecord::Socks(r) => r.format_with(format, include_routing_fields),
         }
     }
 }
@@ -350,47 +390,57 @@ impl Serialize for Value<'_> {
 }
 
 trait Fields {
-    fn fields(&self) -> Vec<(&'static str, Value<'_>)>;
+    fn fields(&self, include_routing_fields: bool) -> Vec<(&'static str, Value<'_>)>;
 }
 
 impl Fields for HttpAccessRecord {
-    fn fields(&self) -> Vec<(&'static str, Value<'_>)> {
-        vec![
-            ("ts", Value::Owned(format_timestamp(self.ts))),
-            ("kind", Value::Str("http")),
-            ("client", Value::Owned(self.client.to_string())),
-            ("proto", Value::Str(&self.proto)),
-            ("mitm", Value::Bool(self.mitm)),
-            ("method", Value::Str(&self.method)),
-            ("target", Value::Str(&self.target)),
-            ("rule", Value::Str(&self.rule)),
-            ("profile", Value::Str(&self.profile)),
-            ("upstream", Value::Str(&self.upstream)),
-            ("status", Value::U64(u64::from(self.status))),
-            ("bytes_in", Value::U64(self.bytes_in)),
-            ("bytes_out", Value::U64(self.bytes_out)),
-            ("duration_ms", Value::U64(self.duration_ms)),
-        ]
+    fn fields(&self, include_routing_fields: bool) -> Vec<(&'static str, Value<'_>)> {
+        let mut out = Vec::with_capacity(15);
+        out.push(("ts", Value::Owned(format_timestamp(self.ts))));
+        out.push(("kind", Value::Str("http")));
+        if let Some(dir) = self.direction {
+            out.push(("direction", Value::Str(dir.as_str())));
+        }
+        out.push(("client", Value::Owned(self.client.to_string())));
+        out.push(("proto", Value::Str(&self.proto)));
+        out.push(("mitm", Value::Bool(self.mitm)));
+        out.push(("method", Value::Str(&self.method)));
+        out.push(("target", Value::Str(&self.target)));
+        if include_routing_fields {
+            out.push(("rule", Value::Str(&self.rule)));
+            out.push(("profile", Value::Str(&self.profile)));
+            out.push(("upstream", Value::Str(&self.upstream)));
+        }
+        out.push(("status", Value::U64(u64::from(self.status))));
+        out.push(("bytes_in", Value::U64(self.bytes_in)));
+        out.push(("bytes_out", Value::U64(self.bytes_out)));
+        out.push(("duration_ms", Value::U64(self.duration_ms)));
+        out
     }
 }
 
 impl Fields for SocksLogRecord {
-    fn fields(&self) -> Vec<(&'static str, Value<'_>)> {
-        vec![
-            ("ts", Value::Owned(format_timestamp(self.ts))),
-            ("kind", Value::Str("socks")),
-            ("client", Value::Owned(self.client.to_string())),
-            ("proto", Value::Str(&self.proto)),
-            ("cmd", Value::Str(&self.cmd)),
-            ("target", Value::Str(&self.target)),
-            ("rule", Value::Str(&self.rule)),
-            ("profile", Value::Str(&self.profile)),
-            ("upstream", Value::Str(&self.upstream)),
-            ("status", Value::Str(&self.status)),
-            ("bytes_in", Value::U64(self.bytes_in)),
-            ("bytes_out", Value::U64(self.bytes_out)),
-            ("duration_ms", Value::U64(self.duration_ms)),
-        ]
+    fn fields(&self, include_routing_fields: bool) -> Vec<(&'static str, Value<'_>)> {
+        let mut out = Vec::with_capacity(14);
+        out.push(("ts", Value::Owned(format_timestamp(self.ts))));
+        out.push(("kind", Value::Str("socks")));
+        if let Some(dir) = self.direction {
+            out.push(("direction", Value::Str(dir.as_str())));
+        }
+        out.push(("client", Value::Owned(self.client.to_string())));
+        out.push(("proto", Value::Str(&self.proto)));
+        out.push(("cmd", Value::Str(&self.cmd)));
+        out.push(("target", Value::Str(&self.target)));
+        if include_routing_fields {
+            out.push(("rule", Value::Str(&self.rule)));
+            out.push(("profile", Value::Str(&self.profile)));
+            out.push(("upstream", Value::Str(&self.upstream)));
+        }
+        out.push(("status", Value::Str(&self.status)));
+        out.push(("bytes_in", Value::U64(self.bytes_in)));
+        out.push(("bytes_out", Value::U64(self.bytes_out)));
+        out.push(("duration_ms", Value::U64(self.duration_ms)));
+        out
     }
 }
 
@@ -458,14 +508,24 @@ fn encode(fields: &[(&'static str, Value<'_>)], format: LogFormat) -> String {
 impl HttpAccessRecord {
     /// Encode as one line (without trailing newline).
     pub fn format(&self, format: LogFormat) -> String {
-        encode(&self.fields(), format)
+        self.format_with(format, true)
+    }
+
+    /// Encode as one line, optionally omitting `rule`, `profile`, and `upstream`.
+    pub fn format_with(&self, format: LogFormat, include_routing_fields: bool) -> String {
+        encode(&self.fields(include_routing_fields), format)
     }
 }
 
 impl SocksLogRecord {
     /// Encode as one line (without trailing newline).
     pub fn format(&self, format: LogFormat) -> String {
-        encode(&self.fields(), format)
+        self.format_with(format, true)
+    }
+
+    /// Encode as one line, optionally omitting `rule`, `profile`, and `upstream`.
+    pub fn format_with(&self, format: LogFormat, include_routing_fields: bool) -> String {
+        encode(&self.fields(include_routing_fields), format)
     }
 }
 
@@ -481,6 +541,10 @@ pub struct AccessLogConfig {
     pub socks_log: Option<PathBuf>,
     /// Also dump every record to `stdout` (true at `DEBUG` / `VERBOSE`).
     pub dump_stdout: bool,
+    /// Whether formatted lines include the routing fields (`rule`, `profile`, `upstream`).
+    /// Defaults to `true`; consumers without user-visible routing rules (`rusty-conduit`,
+    /// `rusty-conduit-ssh`) set this to `false` to keep their existing log schema.
+    pub include_routing_fields: bool,
 }
 
 impl AccessLogConfig {
@@ -495,7 +559,14 @@ impl AccessLogConfig {
             http_access_log,
             socks_log,
             dump_stdout: level.dumps_access_to_stdout(),
+            include_routing_fields: true,
         }
+    }
+
+    /// Control whether formatted access lines include `rule`, `profile`, and `upstream`.
+    pub fn with_routing_fields(mut self, include: bool) -> Self {
+        self.include_routing_fields = include;
+        self
     }
 }
 
@@ -564,6 +635,8 @@ async fn open_append(path: &Path) -> io::Result<BufWriter<tokio::fs::File>> {
 #[derive(Clone)]
 pub struct AccessLogger {
     format: LogFormat,
+    include_routing_fields: bool,
+    direction: Option<ProxyDirection>,
     http_active: bool,
     socks_active: bool,
     tx: Option<mpsc::Sender<Command>>,
@@ -576,6 +649,8 @@ impl fmt::Debug for AccessLogger {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AccessLogger")
             .field("format", &self.format)
+            .field("include_routing_fields", &self.include_routing_fields)
+            .field("direction", &self.direction)
             .field("http_active", &self.http_active)
             .field("socks_active", &self.socks_active)
             .field("sink", &self.sink.is_some())
@@ -613,6 +688,8 @@ impl AccessLogger {
         if !http_active && !socks_active {
             return Ok(Self {
                 format: config.format,
+                include_routing_fields: config.include_routing_fields,
+                direction: None,
                 http_active,
                 socks_active,
                 tx: None,
@@ -654,6 +731,8 @@ impl AccessLogger {
 
         Ok(Self {
             format: config.format,
+            include_routing_fields: config.include_routing_fields,
+            direction: None,
             http_active,
             socks_active,
             tx: Some(tx),
@@ -661,6 +740,20 @@ impl AccessLogger {
             errors,
             sink: None,
         })
+    }
+
+    /// Tag every record emitted through this logger handle with `direction` (unless the
+    /// record already carries one). Clones share the same underlying writer task.
+    pub fn with_direction(mut self, direction: ProxyDirection) -> Self {
+        self.direction = Some(direction);
+        self
+    }
+
+    /// Control whether formatted lines written through this handle include `rule`,
+    /// `profile`, and `upstream`.
+    pub fn with_routing_fields(mut self, include: bool) -> Self {
+        self.include_routing_fields = include;
+        self
     }
 
     /// Also deliver every record as a structured [`AccessRecord`] to `sink`, alongside the
@@ -709,21 +802,43 @@ impl AccessLogger {
 
     /// Record an HTTP/HTTPS access entry.
     pub async fn log_http(&self, record: &HttpAccessRecord) {
+        let mut owned;
+        let record = if record.direction.is_none() && self.direction.is_some() {
+            owned = record.clone();
+            owned.direction = self.direction;
+            &owned
+        } else {
+            record
+        };
         if let Some(sink) = &self.sink {
             sink(&AccessRecord::Http(record.clone()));
         }
         if self.http_active {
-            self.send(Command::Http(record.format(self.format))).await;
+            self.send(Command::Http(
+                record.format_with(self.format, self.include_routing_fields),
+            ))
+            .await;
         }
     }
 
     /// Record a SOCKS connection entry.
     pub async fn log_socks(&self, record: &SocksLogRecord) {
+        let mut owned;
+        let record = if record.direction.is_none() && self.direction.is_some() {
+            owned = record.clone();
+            owned.direction = self.direction;
+            &owned
+        } else {
+            record
+        };
         if let Some(sink) = &self.sink {
             sink(&AccessRecord::Socks(record.clone()));
         }
         if self.socks_active {
-            self.send(Command::Socks(record.format(self.format))).await;
+            self.send(Command::Socks(
+                record.format_with(self.format, self.include_routing_fields),
+            ))
+            .await;
         }
     }
 
@@ -809,6 +924,7 @@ mod tests {
     fn http_record() -> HttpAccessRecord {
         HttpAccessRecord {
             ts: datetime!(2026-11-22 13:30:01.123456 UTC),
+            direction: None,
             client: "127.0.0.1:51234".parse().unwrap(),
             proto: "https".into(),
             mitm: true,
@@ -827,6 +943,7 @@ mod tests {
     fn socks_record() -> SocksLogRecord {
         SocksLogRecord {
             ts: datetime!(2026-11-22 13:30:02.456 UTC),
+            direction: None,
             client: "127.0.0.1:51240".parse().unwrap(),
             proto: "socks5".into(),
             cmd: "CONNECT".into(),
@@ -1236,5 +1353,70 @@ mod tests {
         // A dropped receiver does not break logging.
         drop(rx);
         logger.log_http(&http_record()).await;
+    }
+
+    #[tokio::test]
+    async fn routing_fields_toggle_and_direction_tag_work_in_text_json_and_sink() {
+        let stdout = Buf::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let base = AccessLogger::start_with_stdout(
+            AccessLogConfig::new(LogLevel::Debug, LogFormat::Text, None, None)
+                .with_routing_fields(false),
+            Box::new(stdout.clone()),
+            Logger::with_writer(LogLevel::Quiet, Box::new(io::sink())),
+        )
+        .await
+        .unwrap()
+        .with_channel(tx);
+
+        let fwd = base.clone().with_direction(ProxyDirection::Forward);
+        let rev = base.clone().with_direction(ProxyDirection::Reverse);
+
+        fwd.log_http(&http_record()).await;
+        rev.log_socks(&socks_record()).await;
+        base.shutdown().await.unwrap();
+
+        let text = stdout.text();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            lines[0].contains("kind=http direction=forward client="),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("target=https://example.com/api/v1 status=200"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            !lines[0].contains("rule=")
+                && !lines[0].contains("profile=")
+                && !lines[0].contains("upstream="),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("kind=socks direction=reverse client="),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("target=github.com:22 status=ok"),
+            "{}",
+            lines[1]
+        );
+
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        assert_eq!(first.direction(), Some(ProxyDirection::Forward));
+        assert_eq!(second.direction(), Some(ProxyDirection::Reverse));
+
+        let json: serde_json::Value =
+            serde_json::from_str(&first.format_with(LogFormat::Json, false)).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 12);
+        assert_eq!(obj["direction"], "forward");
+        assert!(!obj.contains_key("rule"));
     }
 }
