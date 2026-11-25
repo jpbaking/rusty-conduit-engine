@@ -1,6 +1,6 @@
 # phase-0001 — Confirm rusty-conduit-switch CI, tag v0.0.1-beta.2, and watch all 3 Release workflows
 
-- Status: todo
+- Status: ongoing
 - Owner: planner
 - Depends on: none
 - Goal: Wait for `rusty-conduit-switch` `main` CI (`#45700865218`), tag and push `v0.0.1-beta.2`, and verify all three CLI Release workflows complete cleanly.
@@ -33,6 +33,7 @@ gh -R jpbaking/rusty-conduit run view 45701315242 --json conclusion -q .conclusi
 
 ## Log
 - (append-only, one line per event)
+- began phase-0001 on resume
 
 ## Evidence
 - (append-only: command → observed result)
