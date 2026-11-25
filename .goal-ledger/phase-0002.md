@@ -1,6 +1,6 @@
 # phase-0002 — Update GitHub Release notes for all 3 CLIs with divergence ledger entries
 
-- Status: todo
+- Status: ongoing
 - Owner: planner
 - Depends on: phase-0001
 - Goal: Edit the auto-generated GitHub Release notes for `rusty-conduit-switch` (`v0.0.1-beta.2`), `rusty-conduit` (`v1.3.0`), and `rusty-conduit-ssh` (`v1.4.0`) to include clear summaries of the `rusty-conduit-engine v0.2.0` migration and each CLI's entries from `docs/DIVERGENCE-LEDGER.md`.
@@ -32,6 +32,7 @@ gh -R jpbaking/rusty-conduit-switch release view v0.0.1-beta.2 --json body -q .b
 
 ## Log
 - (append-only, one line per event)
+- began phase-0002
 
 ## Evidence
 - (append-only: command → observed result)

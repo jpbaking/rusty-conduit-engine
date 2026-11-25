@@ -25,13 +25,13 @@
 
 ## Phases
 - [done] phase-0001 — Confirm rusty-conduit-switch CI, tag v0.0.1-beta.2, and watch all 3 Release workflows
-- [todo] phase-0002 — Update GitHub Release notes for all 3 CLIs with divergence ledger entries
+- [ongoing] phase-0002 — Update GitHub Release notes for all 3 CLIs with divergence ledger entries
 
 ## Handoff
-- Current position: phase-0001 done; ready to begin phase-0002
+- Current position: phase-0002 ongoing
 - Next role: planner
-- Next action: begin phase-0002 — update GitHub Release notes for all 3 CLIs with divergence ledger entries
-- Last verified evidence: phase-0001 `## Verify` passed (rusty-conduit #45701315242, rusty-conduit-ssh #45701367206, rusty-conduit-switch #45702789898 all `completed/success`); note `origin/main` advanced to `3b55f18` (automated squash prohibited on `current-branch`)
+- Next action: update GitHub Release notes via `gh release edit` for `rusty-conduit-switch` `v0.0.1-beta.2`, `rusty-conduit` `v1.3.0`, and `rusty-conduit-ssh` `v1.4.0` with `rusty-conduit-engine v0.2.0` migration summaries and `docs/DIVERGENCE-LEDGER.md` entries
+- Last verified evidence: phase-0001 closed (`8073955`); all 3 GitHub Releases exist (`v0.0.1-beta.2`, `v1.3.0`, `v1.4.0`); note `origin/main` advanced to `3b55f18` (automated squash prohibited on `current-branch`)
 - Blockers: none
 
 ## Review
@@ -44,3 +44,4 @@
 - created E5 handoff ledger after completing E0–E4, releasing rusty-conduit-engine v0.2.0, merging all 3 CLIs to main, and tagging rusty-conduit v1.3.0 and rusty-conduit-ssh v1.4.0
 - resumed goal as planner: verified `main` at `3b55f18` (clean tree, baseline `bc05012` ancestor, 1 matching Goal-ID commit, validator clean; noted `origin/main` published at `3b55f18` so automated squash is unavailable); beginning `phase-0001`
 - closed phase-0001: tagged & pushed `rusty-conduit-switch` `v0.0.1-beta.2` (`8ee5c3948d18`), all 3 CLI Release workflows (`#45701315242`, `#45701367206`, `#45702789898`) verified `success`
+- began phase-0002: updating GitHub Release notes for all 3 CLIs with divergence ledger entries
