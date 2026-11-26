@@ -135,14 +135,20 @@ impl EngineHandlers {
         )
     }
 
+    /// Block HTTP/HTTPS traffic over SOCKS by installing [`WebGuard`].
+    ///
+    /// Works independently of HTTPS MITM interception.
+    pub fn with_socks_block_web(mut self) -> Self {
+        self.socks = self.socks.with_guard(Arc::new(WebGuard));
+        self
+    }
+
     /// Enable HTTPS interception on the HTTP engine; with `socks_block_web`
-    /// (`--socks-block-web-in-mitm`) also install the SOCKS [`WebGuard`], so web traffic
-    /// cannot bypass MITM logging by tunnelling over SOCKS. The guard is only ever installed
-    /// together with MITM.
+    /// also install the SOCKS [`WebGuard`].
     pub fn with_mitm(mut self, interceptor: Arc<MitmInterceptor>, socks_block_web: bool) -> Self {
         self.http = self.http.with_mitm(interceptor);
         if socks_block_web {
-            self.socks = self.socks.with_guard(Arc::new(WebGuard));
+            self = self.with_socks_block_web();
         }
         self
     }

@@ -1185,13 +1185,7 @@ pub(crate) mod test_support {
         .filter(|p| *p > 0)
         .collect();
         ports.dedup();
-        let filter = if !file.filter.allow.is_empty() {
-            Some(HostFilter::Allow(rules(&file.filter.allow)))
-        } else if !file.filter.block.is_empty() {
-            Some(HostFilter::Block(rules(&file.filter.block)))
-        } else {
-            None
-        };
+        let filter = HostFilter::from_lists(rules(&file.filter.allow), rules(&file.filter.block));
         RoutingInput {
             profiles: file.profiles,
             filter,

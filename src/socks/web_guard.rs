@@ -1,7 +1,7 @@
-//! `--socks-block-web-in-mitm`: keep web traffic from bypassing HTTPS MITM logging by
-//! tunnelling over SOCKS.
+//! `--socks-block-web` (alias `--socks-block-web-in-mitm`): block HTTP/HTTPS traffic over SOCKS
+//! (for example to keep web traffic on the HTTP/HTTPS listener, with or without MITM enabled).
 //!
-//! Installed as the SOCKS [`RelayGuard`] only when MITM is ON and the flag is set. The
+//! Installed as the SOCKS [`RelayGuard`] whenever SOCKS web blocking is enabled. The
 //! SOCKS relay forwards upstream → client bytes immediately (server-speaks-first protocols
 //! such as SSH, SMTP, or Postgres are never delayed) and hands the **first**
 //! client → upstream chunk to [`WebGuard::inspect`]. It is blocked when it is:

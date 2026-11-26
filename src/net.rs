@@ -155,14 +155,26 @@ pub async fn connect_upstream_filtered(
     }
 
     let domain = normalize_domain(host);
-    let domain_matched = filter.matches_domain(&domain);
+    let domain_allowed = filter
+        .allow_rules()
+        .iter()
+        .any(|r| r.matches_domain(&domain));
+    let domain_blocked = filter
+        .block_rules()
+        .iter()
+        .any(|r| r.matches_domain(&domain));
     match filter {
-        HostFilter::Block(_) if domain_matched => {
+        HostFilter::Block(_) if domain_blocked => {
             return Err(access_denied_error(AccessDenied(format!(
                 "destination {host} is blocklisted"
             ))));
         }
-        HostFilter::Allow(_) if !domain_matched && !filter.has_ip_rules() => {
+        HostFilter::BlockExcept { .. } if domain_blocked && !domain_allowed => {
+            return Err(access_denied_error(AccessDenied(format!(
+                "destination {host} is blocklisted"
+            ))));
+        }
+        HostFilter::Allow(_) if !domain_allowed && !filter.has_ip_rules() => {
             return Err(access_denied_error(AccessDenied(format!(
                 "destination {host} is not in allowlist"
             ))));
@@ -184,7 +196,10 @@ pub async fn connect_upstream_filtered(
 
     let candidates: Vec<SocketAddr> = match filter {
         HostFilter::Block(_) => {
-            if let Some(blocked) = resolved.iter().find(|a| filter.matches_ip(a.ip())) {
+            if let Some(blocked) = resolved
+                .iter()
+                .find(|a| filter.block_rules().iter().any(|r| r.matches_ip(a.ip())))
+            {
                 return Err(access_denied_error(AccessDenied(format!(
                     "destination {host} resolved to blocklisted IP {}",
                     blocked.ip()
@@ -192,11 +207,25 @@ pub async fn connect_upstream_filtered(
             }
             resolved
         }
-        HostFilter::Allow(_) if domain_matched => resolved,
+        HostFilter::BlockExcept { block, allow } => {
+            // Resolved-IP blocklist stays active unless the IP itself is allowlisted,
+            // preventing DNS-rebinding bypasses (e.g., an allowlisted domain resolving to 127.0.0.1).
+            if let Some(blocked) = resolved.iter().find(|a| {
+                block.iter().any(|r| r.matches_ip(a.ip()))
+                    && !allow.iter().any(|r| r.matches_ip(a.ip()))
+            }) {
+                return Err(access_denied_error(AccessDenied(format!(
+                    "destination {host} resolved to blocklisted IP {}",
+                    blocked.ip()
+                ))));
+            }
+            resolved
+        }
+        HostFilter::Allow(_) if domain_allowed => resolved,
         HostFilter::Allow(_) => {
             let allowed: Vec<SocketAddr> = resolved
                 .into_iter()
-                .filter(|a| filter.matches_ip(a.ip()))
+                .filter(|a| filter.allow_rules().iter().any(|r| r.matches_ip(a.ip())))
                 .collect();
             if allowed.is_empty() {
                 return Err(access_denied_error(AccessDenied(format!(
@@ -469,5 +498,58 @@ mod tests {
         ps.read_to_end(&mut out).await.unwrap();
         upstream_task.await.unwrap();
         assert_eq!(out, b"BODY");
+    }
+
+    #[tokio::test]
+    async fn connect_upstream_filtered_block_except_keeps_resolved_ip_blocklist() {
+        use crate::filter::{is_access_denied, FilterRule};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await });
+
+        // `localhost` is allowlisted as a domain exception, but `127.0.0.0/8` and `::1` are
+        // blocklisted without an IP exception — resolved-IP blocklist still blocks DNS-to-loopback.
+        let blocked_ip = HostFilter::BlockExcept {
+            block: vec![
+                "localhost".parse::<FilterRule>().unwrap(),
+                "127.0.0.0/8".parse::<FilterRule>().unwrap(),
+                "::1".parse::<FilterRule>().unwrap(),
+            ],
+            allow: vec!["localhost".parse::<FilterRule>().unwrap()],
+        };
+        let err = connect_upstream_filtered(
+            "localhost",
+            port,
+            Duration::from_secs(5),
+            Some(&blocked_ip),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(is_access_denied(&err));
+
+        // When the loopback IP is also allowlisted, the connection succeeds.
+        let allowed_both = HostFilter::BlockExcept {
+            block: vec![
+                "localhost".parse::<FilterRule>().unwrap(),
+                "127.0.0.0/8".parse::<FilterRule>().unwrap(),
+                "::1".parse::<FilterRule>().unwrap(),
+            ],
+            allow: vec![
+                "localhost".parse::<FilterRule>().unwrap(),
+                "127.0.0.1".parse::<FilterRule>().unwrap(),
+                "::1".parse::<FilterRule>().unwrap(),
+            ],
+        };
+        let _stream = connect_upstream_filtered(
+            "localhost",
+            port,
+            Duration::from_secs(5),
+            Some(&allowed_both),
+            None,
+        )
+        .await
+        .unwrap();
+        accept.await.unwrap().unwrap();
     }
 }

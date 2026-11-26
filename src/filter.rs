@@ -1,7 +1,7 @@
 //! Destination allowlist / blocklist filtering for IP, CIDR, and FQDN (with `*.` wildcards).
 //!
-//! A [`HostFilter`] is either an allowlist ([`HostFilter::Allow`]) or a blocklist
-//! ([`HostFilter::Block`]) — never both.
+//! A [`HostFilter`] is an allowlist ([`HostFilter::Allow`]), a blocklist ([`HostFilter::Block`]),
+//! or a blocklist with allowlist exceptions ([`HostFilter::BlockExcept`]).
 //!
 //! Because `rusty-conduit` dials destinations directly through the OS resolver
 //! ([`crate::net::connect_upstream_filtered`]), both domain rules and resolved-IP IP/CIDR rules
@@ -161,51 +161,97 @@ impl FromStr for FilterRule {
     }
 }
 
-/// Mutually exclusive destination filter policy.
+/// Destination filter policy.
+///
+/// - [`HostFilter::Allow`]: default-deny; only matching destinations are allowed.
+/// - [`HostFilter::Block`]: default-allow; matching destinations are blocked.
+/// - [`HostFilter::BlockExcept`]: default-allow; destinations matching `block` are blocked
+///   unless they match an exception in `allow`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HostFilter {
     Allow(Vec<FilterRule>),
     Block(Vec<FilterRule>),
+    BlockExcept {
+        block: Vec<FilterRule>,
+        allow: Vec<FilterRule>,
+    },
 }
 
 impl HostFilter {
-    /// Policy mode label for summaries and logs (`allow` or `block`).
+    /// Build a [`HostFilter`] from optional allowlist and blocklist rule vectors.
+    ///
+    /// - Both empty → `None`
+    /// - Only `allow` non-empty → `Some(HostFilter::Allow(allow))`
+    /// - Only `block` non-empty → `Some(HostFilter::Block(block))`
+    /// - Both non-empty → `Some(HostFilter::BlockExcept { block, allow })`
+    pub fn from_lists(allow: Vec<FilterRule>, block: Vec<FilterRule>) -> Option<Self> {
+        match (allow.is_empty(), block.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(Self::Allow(allow)),
+            (true, false) => Some(Self::Block(block)),
+            (false, false) => Some(Self::BlockExcept { block, allow }),
+        }
+    }
+
+    /// Policy mode label for summaries and logs (`allow`, `block`, or `block-except`).
     pub fn mode_str(&self) -> &'static str {
         match self {
             Self::Allow(_) => "allow",
             Self::Block(_) => "block",
+            Self::BlockExcept { .. } => "block-except",
         }
     }
 
-    /// Number of rules in this filter.
+    /// Total number of rules in this filter.
     pub fn len(&self) -> usize {
-        self.rules().len()
+        match self {
+            Self::Allow(rules) | Self::Block(rules) => rules.len(),
+            Self::BlockExcept { block, allow } => block.len() + allow.len(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rules().is_empty()
+        self.len() == 0
     }
 
-    pub fn rules(&self) -> &[FilterRule] {
+    /// Allowlist rules (or exception rules for [`HostFilter::BlockExcept`]).
+    pub fn allow_rules(&self) -> &[FilterRule] {
         match self {
-            Self::Allow(rules) | Self::Block(rules) => rules,
+            Self::Allow(rules) | Self::BlockExcept { allow: rules, .. } => rules,
+            Self::Block(_) => &[],
+        }
+    }
+
+    /// Blocklist rules.
+    pub fn block_rules(&self) -> &[FilterRule] {
+        match self {
+            Self::Block(rules) | Self::BlockExcept { block: rules, .. } => rules,
+            Self::Allow(_) => &[],
         }
     }
 
     /// Whether any rule in this filter can match an IP address.
     pub fn has_ip_rules(&self) -> bool {
-        self.rules().iter().any(FilterRule::is_ip_rule)
+        self.allow_rules().iter().any(FilterRule::is_ip_rule)
+            || self.block_rules().iter().any(FilterRule::is_ip_rule)
     }
 
     /// Whether any rule in this filter matches `ip`.
     pub fn matches_ip(&self, ip: IpAddr) -> bool {
-        self.rules().iter().any(|r| r.matches_ip(ip))
+        self.allow_rules().iter().any(|r| r.matches_ip(ip))
+            || self.block_rules().iter().any(|r| r.matches_ip(ip))
     }
 
     /// Whether any rule in this filter matches `domain` (case-insensitive, trailing dot ignored).
     pub fn matches_domain(&self, domain: &str) -> bool {
         let normalized = normalize_domain(domain);
-        self.rules().iter().any(|r| r.matches_domain(&normalized))
+        self.allow_rules()
+            .iter()
+            .any(|r| r.matches_domain(&normalized))
+            || self
+                .block_rules()
+                .iter()
+                .any(|r| r.matches_domain(&normalized))
     }
 
     /// Check a destination host string (literal IP or domain) without resolving DNS.
@@ -232,6 +278,15 @@ impl HostFilter {
                     Ok(())
                 }
             }
+            Self::BlockExcept { block, allow } => {
+                if allow.iter().any(|r| r.matches_domain(&domain)) {
+                    Ok(())
+                } else if block.iter().any(|r| r.matches_domain(&domain)) {
+                    Err(AccessDenied(format!("destination {host} is blocklisted")))
+                } else {
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -249,6 +304,15 @@ impl HostFilter {
             }
             Self::Block(rules) => {
                 if rules.iter().any(|r| r.matches_ip(ip)) {
+                    Err(AccessDenied(format!("destination {ip} is blocklisted")))
+                } else {
+                    Ok(())
+                }
+            }
+            Self::BlockExcept { block, allow } => {
+                if allow.iter().any(|r| r.matches_ip(ip)) {
+                    Ok(())
+                } else if block.iter().any(|r| r.matches_ip(ip)) {
                     Err(AccessDenied(format!("destination {ip} is blocklisted")))
                 } else {
                     Ok(())
@@ -457,6 +521,35 @@ mod tests {
         assert!(block.check_host("db.internal").is_err());
         assert!(block.check_host("example.com").is_ok());
         assert!(block.check_host("1.1.1.1").is_ok());
+    }
+
+    #[test]
+    fn block_except_allows_exceptions_to_blocklist() {
+        let filter = HostFilter::from_lists(
+            vec![rule("test.domain.net"), rule("10.1.2.3")],
+            vec![rule("*.domain.net"), rule("10.0.0.0/8")],
+        )
+        .unwrap();
+        assert_eq!(filter.mode_str(), "block-except");
+        assert_eq!(filter.len(), 4);
+        assert!(filter.check_host("test.domain.net").is_ok());
+        assert!(filter.check_host("TEST.DOMAIN.NET.").is_ok());
+        assert!(filter.check_host("other.domain.net").is_err());
+        assert!(filter.check_host("domain.net").is_ok());
+        assert!(filter.check_host("example.com").is_ok());
+        assert!(filter.check_host("10.1.2.3").is_ok());
+        assert!(filter.check_host("10.1.2.4").is_err());
+        assert!(filter.check_host("1.1.1.1").is_ok());
+
+        assert!(HostFilter::from_lists(vec![], vec![]).is_none());
+        assert!(matches!(
+            HostFilter::from_lists(vec![rule("a.example")], vec![]),
+            Some(HostFilter::Allow(_))
+        ));
+        assert!(matches!(
+            HostFilter::from_lists(vec![], vec![rule("a.example")]),
+            Some(HostFilter::Block(_))
+        ));
     }
 
     #[test]
