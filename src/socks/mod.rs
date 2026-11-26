@@ -20,7 +20,7 @@
 //! [`GuardVerdict::Block`] closes both sockets without forwarding it and records the
 //! verdict's status label. Afterwards the relay switches to plain bidirectional copying.
 //!
-//! [`web_guard::WebGuard`] is the guard used for `--socks-block-web-in-mitm`.
+//! [`web_guard::WebGuard`] is the guard used for `--socks-block-web`.
 
 pub mod v4;
 pub mod v5;
@@ -208,7 +208,7 @@ impl SocksProxy {
         }
     }
 
-    /// Install a first-chunk relay guard (used by `--socks-block-web-in-mitm`).
+    /// Install a first-chunk relay guard (used by `--socks-block-web`).
     pub fn with_guard(mut self, guard: Arc<dyn RelayGuard>) -> Self {
         self.guard = Some(guard);
         self

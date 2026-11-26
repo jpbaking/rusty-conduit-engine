@@ -1,4 +1,4 @@
-//! `--socks-block-web` (alias `--socks-block-web-in-mitm`): block HTTP/HTTPS traffic over SOCKS
+//! `--socks-block-web`: block HTTP/HTTPS traffic over SOCKS
 //! (for example to keep web traffic on the HTTP/HTTPS listener, with or without MITM enabled).
 //!
 //! Installed as the SOCKS [`RelayGuard`] whenever SOCKS web blocking is enabled. The

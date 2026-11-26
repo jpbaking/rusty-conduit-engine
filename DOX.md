@@ -215,7 +215,7 @@ When the owning doc lies inside a nested root, make the update there — but say
 
 ## Project Contract
 
-`rusty-conduit-engine` is a library-only Rust crate (`rusty_conduit_engine`, BSD-3-Clause) holding the HTTP/HTTPS and SOCKS proxy engine, routing, upstream dialers, and optional HTTPS MITM shared by the rusty-conduit CLI family (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, and the planned `rusty-conduit-gui`). Roadmap: `docs/MASTER-PLAN.md`.
+`rusty-conduit-engine` is a library-only Rust crate (`rusty_conduit_engine`, BSD-3-Clause) holding the HTTP/HTTPS and SOCKS proxy engine, routing, upstream dialers, and optional HTTPS MITM shared by the rusty-conduit CLI family (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, and `rusty-conduit-gui`). Open items: `docs/TODO.md`.
 
 - **Scope.** This repository only. Consumers live in sibling repositories; never edit them from here. Development happens on `main`.
 - **No CLI concerns.** No argument parsing, config-file loading, file watching, signal handling, or SSH process supervision. Do not add `clap`, `notify`, or a non-dev `toml` dependency. The CLIs deserialize their own config formats into the serde types in `src/routing.rs`.
@@ -254,12 +254,12 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Traffic counters** — live per-profile and per-rule `hits`, `active`, `bytes_in`, `bytes_out`. Start: `src/routing.rs`. Files: `src/http/mod.rs`, `src/http/tunnel.rs`, `src/socks/mod.rs`, `tests/traffic_counters.rs`.
 - **Destination filter** — allow/block lists for IP, CIDR, and FQDN (with `*.` wildcards), enforced on both names and resolved IPs. Start: `src/filter.rs`. Files: `src/net.rs`, `src/router/mod.rs`.
 - **TCP dial and relay helpers** — OS-resolver dialing with timeouts, TCP keepalive, `PrefixedStream`, bidirectional relay. Start: `src/net.rs`.
-- **Logging and access records** — 6-level diagnostic logger, text/JSON access logs, and the structured `AccessRecord` sink for embedders. Start: `src/logging.rs`.
+- **Logging and access records** — 6-level diagnostic logger, text/JSON access logs (file sinks flushed whenever the writer queue drains), and the structured `AccessRecord` sink for embedders. Start: `src/logging.rs`.
 - **`routing` cargo feature gate** — regex-based rule matching behind the default-on feature. Start: `Cargo.toml`. Files: `src/router/condition.rs`.
 - **Pure-Rust crypto policy check** — fails if `openssl-sys` or `aws-lc-sys` is in the dependency graph. Start: `scripts/check-pure-rust-crypto.py`. Files: `Cargo.toml`, `Cargo.lock`.
 - **Continuous integration** — format, clippy, no-default-features, crypto policy, and the test matrix on Linux, macOS, and Windows. Start: `.github/workflows/ci.yml`.
 - **Integration tests** — end-to-end tests of counters, the custom resolver, and MITM. Start: `tests/traffic_counters.rs`. Files: `tests/route_resolver.rs`, `tests/mitm_counters.rs`.
-- **Plan and divergence ledger** — extraction and migration roadmap, and recorded differences from each consumer's former copy. Start: `docs/MASTER-PLAN.md`. Files: `docs/DIVERGENCE-LEDGER.md`.
+- **Divergence ledger and open items** — recorded differences from each consumer's former copy and engine changes every consumer inherits, plus open decisions. Start: `docs/DIVERGENCE-LEDGER.md`. Files: `docs/TODO.md`.
 
 ## Child DOX Index
 

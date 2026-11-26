@@ -11,7 +11,7 @@
 //! text/JSON lines, which are unchanged.
 //!
 //! Every access/SOCKS record carries routing visibility: `rule`, `profile`, and a redacted
-//! `upstream` (credentials are never emitted; see `docs/MASTER-PLAN.md` Section 9).
+//! `upstream` (credentials are never emitted).
 
 use std::fmt;
 use std::io::{self, Write};
@@ -604,6 +604,24 @@ impl Sinks {
         Ok(())
     }
 
+    async fn handle(&mut self, cmd: Command, errors: &Logger) {
+        match cmd {
+            Command::Http(line) => {
+                if let Err(e) = self.write(true, &line).await {
+                    errors.error(format!("http access log write failed: {e}"));
+                }
+            }
+            Command::Socks(line) => {
+                if let Err(e) = self.write(false, &line).await {
+                    errors.error(format!("socks log write failed: {e}"));
+                }
+            }
+            Command::Flush(ack) => {
+                let _ = ack.send(self.flush().await);
+            }
+        }
+    }
+
     async fn flush(&mut self) -> io::Result<()> {
         if let Some(f) = self.http.as_mut() {
             f.flush().await?;
@@ -708,20 +726,15 @@ impl AccessLogger {
         let task_errors = errors.clone();
         let task = tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
-                match cmd {
-                    Command::Http(line) => {
-                        if let Err(e) = sinks.write(true, &line).await {
-                            task_errors.error(format!("http access log write failed: {e}"));
-                        }
-                    }
-                    Command::Socks(line) => {
-                        if let Err(e) = sinks.write(false, &line).await {
-                            task_errors.error(format!("socks log write failed: {e}"));
-                        }
-                    }
-                    Command::Flush(ack) => {
-                        let _ = ack.send(sinks.flush().await);
-                    }
+                sinks.handle(cmd, &task_errors).await;
+                // Drain everything already queued, then flush once the queue is empty: busy
+                // periods still write in large blocks, and a quiet proxy's records reach the
+                // files immediately instead of waiting for the buffer to fill.
+                while let Ok(cmd) = rx.try_recv() {
+                    sinks.handle(cmd, &task_errors).await;
+                }
+                if let Err(e) = sinks.flush().await {
+                    task_errors.error(format!("access log flush failed: {e}"));
                 }
             }
             if let Err(e) = sinks.flush().await {
@@ -873,6 +886,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
+    use std::time::Duration;
     use time::macros::datetime;
 
     /// Shared in-memory buffer usable as both a sync and async writer.
@@ -1230,6 +1244,45 @@ mod tests {
         logger.flush().await.unwrap();
         logger.shutdown().await.unwrap();
         assert!(stdout.text().is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_sinks_flush_when_the_queue_drains() {
+        let http = temp_path("http-idle");
+        let socks = temp_path("socks-idle");
+        let logger = AccessLogger::start_with_stdout(
+            AccessLogConfig::new(
+                LogLevel::Info,
+                LogFormat::Text,
+                Some(http.clone()),
+                Some(socks.clone()),
+            ),
+            Box::new(Buf::default()),
+            Logger::with_writer(LogLevel::Quiet, Box::new(io::sink())),
+        )
+        .await
+        .unwrap();
+        logger.log_http(&http_record()).await;
+        logger.log_socks(&socks_record()).await;
+        // No flush() and no shutdown(): the writer task flushes on its own once idle.
+        let want_http = format!("{}\n", http_record().format(LogFormat::Text));
+        let want_socks = format!("{}\n", socks_record().format(LogFormat::Text));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let got_http = std::fs::read_to_string(&http).unwrap_or_default();
+            let got_socks = std::fs::read_to_string(&socks).unwrap_or_default();
+            if got_http == want_http && got_socks == want_socks {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "records not flushed while idle: http={got_http:?} socks={got_socks:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        logger.shutdown().await.unwrap();
+        std::fs::remove_file(http).ok();
+        std::fs::remove_file(socks).ok();
     }
 
     #[tokio::test]

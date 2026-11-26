@@ -1,10 +1,9 @@
 # Divergence Ledger
 
-This ledger implements [`MASTER-PLAN.md` §6.2](MASTER-PLAN.md). Where a shared module differs
-between the engine and a consumer's former copy (`rusty-conduit`, `rusty-conduit-ssh`,
-`rusty-conduit-switch`), or where the engine changes behavior a consumer relied on, the difference is
-recorded here with a decision. No difference is dropped silently. In E5 each consumer's entries are
-copied into that CLI's changelog.
+Where a shared module differs between the engine and a consumer's former copy
+(`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`), or where the engine changes
+behavior a consumer relied on, the difference is recorded here with a decision. No difference is
+dropped silently. Each consumer's entries are listed in that CLI's release notes.
 
 ## Decisions
 
@@ -77,3 +76,4 @@ Engine changes made after E5 that change behaviour every consumer inherits.
 | ID | Module | Consumers | Difference | Decision | Landed |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | M-01 | `server` | all | Listeners are now bound through `bind_listener`, which requests a listen backlog of `LISTEN_BACKLOG` (4096) instead of the 128 that `TcpListener::bind` requests. The kernel still caps it (`net.core.somaxconn`, 4096 by default on Linux ≥ 5.4; `kern.ipc.somaxconn`, 128 by default on macOS). `SO_REUSEADDR` stays on for non-Windows platforms. Connection bursts larger than 128 no longer overflow the queue on Linux. | keep | `src/server.rs` (`bind_listener`, `backlog_queues_more_than_128_connections`) |
+| M-02 | `logging` | all, GUI | Access-log files (`--http-access-log`, `--socks-log`) were flushed only when the 8 KiB write buffer filled or at shutdown, so a quiet proxy's file could stay empty and a hard kill lost up to 8 KiB. The writer task now drains every queued record and then flushes once the queue is empty: bursts still write in large blocks, and idle records reach the file at once. `stdout` output was already flushed per record. | fix | `src/logging.rs` (writer task, `file_sinks_flush_when_the_queue_drains`) |

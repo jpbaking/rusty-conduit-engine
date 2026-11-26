@@ -58,11 +58,11 @@ cargo test --no-default-features
 python3 scripts/check-pure-rust-crypto.py
 ```
 
-## Plan
+## Divergence ledger and open items
 
-See [`docs/MASTER-PLAN.md`](docs/MASTER-PLAN.md) for the roadmap and milestones, and
-[`docs/DIVERGENCE-LEDGER.md`](docs/DIVERGENCE-LEDGER.md) for the recorded differences from each
-consumer's former copy, with their decisions.
+[`docs/DIVERGENCE-LEDGER.md`](docs/DIVERGENCE-LEDGER.md) records every difference from each
+consumer's former copy, and every engine change consumers inherit, with its decision.
+[`docs/TODO.md`](docs/TODO.md) lists open items.
 
 ## License
 
