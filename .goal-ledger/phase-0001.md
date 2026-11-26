@@ -1,47 +1,76 @@
-# phase-0001 — Confirm rusty-conduit-switch CI, tag v0.0.1-beta.2, and watch all 3 Release workflows
+# phase-0001 — Bind listeners with a 4096 backlog
 
 - Status: done
-- Owner: planner
+- Owner: executor
 - Depends on: none
-- Goal: Wait for `rusty-conduit-switch` `main` CI (`#45700865218`), tag and push `v0.0.1-beta.2`, and verify all three CLI Release workflows complete cleanly.
-- Done when: `rusty-conduit-switch` `v0.0.1-beta.2`, `rusty-conduit` `v1.3.0` (`#45701315242`), and `rusty-conduit-ssh` `v1.4.0` (`#45701367206`) Release workflows all have conclusion `success`.
-- Pattern to follow: none
+- Goal: Make `Server::bind` create every listener with a requested backlog of 4096, keeping all other socket behaviour the same as `TcpListener::bind`.
+- Done when: the full verification in `## Verify` passes and the three new tests exist in `src/server.rs`.
+- Pattern to follow: `src/server.rs:771-790` (`bind_conflict_reports_role_and_addr`, for test shape) and `src/net.rs:419` (`let Ok(listener) = TcpListener::bind("[::1]:0").await else { return; }`, for skipping when IPv6 is unavailable)
 
 ## Context
-All four sibling repositories (`rusty-conduit-engine`, `rusty-conduit-switch`, `rusty-conduit`, `rusty-conduit-ssh`) are already pushed and synced with `origin/main`:
-- `rusty-conduit-engine`: `v0.2.0` released (`bc05012`).
-- `rusty-conduit`: `main` (`f49f1fc`) CI passed (`#45700876479`); `v1.3.0` tagged & pushed; Release workflow `#45701315242` already running.
-- `rusty-conduit-ssh`: `main` (`cc372c9`) CI passed (`#45700888746`); `v1.4.0` tagged & pushed; Release workflow `#45701367206` already running.
-- `rusty-conduit-switch`: `main` (`93398fc`) pushed; CI `#45700865218` was queued when handing off; `v0.0.1-beta.2` has NOT been tagged yet.
+`Server::bind` (`src/server.rs:344-375`) calls `tokio::net::TcpListener::bind`, which goes through mio and always asks the kernel for a backlog of 128. The kernel uses the smaller of the request and its own cap (`net.core.somaxconn`, 4096 by default on Linux ≥ 5.4; `kern.ipc.somaxconn`, 128 on macOS), so today every platform gets 128. Requesting 4096 lets the kernel cap decide. mio also sets `SO_REUSEADDR` on non-Windows platforms before binding; the new helper must do the same so restarts with sockets in `TIME_WAIT` keep working. The planner prototyped exactly this helper against tokio 1.54.1: it binds v4 and v6, keeps `SO_REUSEADDR`, and still fails with `AddrInUse` on a taken port.
+No public API changes except the new public constant. Do not make the backlog configurable.
+Add this code to `src/server.rs`, next to the other constants near the top of the file and above `impl Server`:
+```rust
+/// Listen backlog requested for every listener. The kernel caps it at its own limit
+/// (`net.core.somaxconn` on Linux, `kern.ipc.somaxconn` on macOS); `TcpListener::bind`
+/// would request only 128.
+pub const LISTEN_BACKLOG: u32 = 4096;
+
+/// Bind `addr` like `TcpListener::bind` (with `SO_REUSEADDR` on non-Windows platforms),
+/// but request a listen backlog of [`LISTEN_BACKLOG`].
+fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_BACKLOG)
+}
+```
 
 ## Scope
-- In: `.goal-ledger/**`, git tag `v0.0.1-beta.2` in `../rusty-conduit-switch`
-- Out: application source code in any repository (unless a CI/Release failure requires a fix)
+- In: `src/server.rs`
+- Out: `src/lib.rs`, `src/mux.rs`, `src/net.rs`, `Cargo.toml`, `Cargo.lock`, `tests/`, `docs/`, `DOX.md`, every other file
 
 ## Sub-tasks
-1. [done] Pull latest `main` in all 4 sibling repos and confirm `rusty-conduit-switch` CI `#45700865218` finished with `success` — done when: `gh -R jpbaking/rusty-conduit-switch run view 45700865218 --json conclusion -q .conclusion` prints `success`
-2. [done] Create annotated tag `v0.0.1-beta.2` on `../rusty-conduit-switch` `main` (`93398fc`) and push `origin v0.0.1-beta.2` — done when: `git -C ../rusty-conduit-switch ls-remote --tags origin v0.0.1-beta.2` is non-empty
-3. [done] Wait for and confirm `success` on all three Release workflows (`rusty-conduit` `#45701315242`, `rusty-conduit-ssh` `#45701367206`, and the newly triggered `rusty-conduit-switch` `v0.0.1-beta.2` Release run) — done when: all three Release runs report `completed/success`
+1. [done] Add `TcpSocket` to the `use tokio::net::{...}` line (`src/server.rs:28`), add the constant and helper from `## Context`, and in `Server::bind` replace `TcpListener::bind(addr).await.map_err(bind_err)?` (`src/server.rs:363`) with `bind_listener(addr).map_err(bind_err)?` — done when: `cargo build --locked` succeeds and `grep -n 'TcpListener::bind(addr)' src/server.rs` prints nothing.
+2. [done] In the `mod tests` of `src/server.rs`, add `listen_backlog_is_4096` (asserts `LISTEN_BACKLOG == 4096`) and a `#[cfg(unix)]` async test `listeners_keep_reuse_address` that binds `Server::bind(ListenPlan::Separate { http: Some(loopback(0)), socks: None }, ...)` and asserts `socket2::SockRef::from(&server.listeners[0].2).reuse_address().unwrap()` is `true` — done when: `cargo test --locked --lib server::tests::listen` and `cargo test --locked --lib server::tests::listeners_keep` each run and pass 1 test.
+3. [done] Add a `#[cfg(target_os = "linux")]` async test `backlog_queues_more_than_128_connections`: read `/proc/sys/net/core/somaxconn` (return early if unreadable or below 300); bind a `Server` on `loopback(0)` but do not call `run`, so nothing accepts; connect 300 `TcpStream`s to its HTTP address one after another, each wrapped in `tokio::time::timeout(Duration::from_millis(200), ...)`, keeping the streams alive in a `Vec`; assert that more than 128 connected — done when: `cargo test --locked --lib server::tests::backlog` passes (on macOS the test is compiled out; record that in `## Evidence`).
+4. [done] Add `#[tokio::test] async fn binds_ipv6_loopback()`: skip with the `src/net.rs:419` pattern if `[::1]:0` cannot be bound by `TcpListener`, otherwise `Server::bind` a `ListenPlan::Separate` with `http: Some("[::1]:0".parse().unwrap())` and assert `local_http_addr()` is an IPv6 address — done when: `cargo test --locked --lib server::tests::binds_ipv6` passes.
 
 ## Verify
 ```sh
-gh -R jpbaking/rusty-conduit run view 45701315242 --json conclusion -q .conclusion | grep -qx success && gh -R jpbaking/rusty-conduit-ssh run view 45701367206 --json conclusion -q .conclusion | grep -qx success && gh -R jpbaking/rusty-conduit-switch run list --workflow=release.yml --limit 1 --json headBranch,conclusion -q '.[0] | "\(.headBranch) \(.conclusion)"' | grep -qx "v0.0.1-beta.2 success"
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
+cargo test --locked
+cargo test --no-default-features --locked
+python3 scripts/check-pure-rust-crypto.py
+! grep -n 'TcpListener::bind(addr)' src/server.rs
 ```
 
 ## Escalate when
-- Any CI or Release workflow fails → stop, inspect failed job logs, and report exact failure before fixing
+- `bind_conflict_reports_role_and_addr` or any existing test fails after the switch to `bind_listener` → stop, set Status: needs-human — reason: paste the failing test and error.
+- `socket2::SockRef` is not usable from the unit tests (for example the dev-dependency features differ from what `Cargo.toml` line 61 shows) → stop, set Status: needs-human — reason: paste the compiler error.
+- Any other file needs to change to make the build or tests pass → stop, set Status: needs-human — reason: name the file and why.
 
 ## Log
 - (append-only, one line per event)
-- began phase-0001 on resume
-- sub-task 1 done: sibling repos synced (`Already up to date.`), `rusty-conduit-switch` CI `#45700865218` (`93398fc`) succeeded; also observed `rusty-conduit` Release `#45701315242` and `rusty-conduit-ssh` Release `#45701367206` already `completed/success`
-- sub-task 2 done: created annotated tag `v0.0.1-beta.2` on `93398fc` and pushed to `origin` (`8ee5c3948d18c5fb1bdf27840c8ca02727b7fe94`)
-- sub-task 3 done & phase verified: `rusty-conduit-switch` Release `#45702789898` (`v0.0.1-beta.2`) completed with `success` (all 6 targets, multi-arch GHCR Docker image, GitHub Release); `## Verify` passed
+- sub-task 1: imported `TcpSocket`, added `LISTEN_BACKLOG` and `bind_listener`, and updated `Server::bind` in `src/server.rs`
+- sub-task 2: added `listen_backlog_is_4096` and `listeners_keep_reuse_address` tests in `src/server.rs`
+- sub-task 3: added Linux-only `backlog_queues_more_than_128_connections` test in `src/server.rs`
+- sub-task 4: added `binds_ipv6_loopback` test in `src/server.rs`
+- verify: ran all `## Verify` commands; all passed
 
 ## Evidence
 - (append-only: command → observed result)
-- `git -C ../rusty-conduit-switch pull --ff-only && git -C ../rusty-conduit pull --ff-only && git -C ../rusty-conduit-ssh pull --ff-only` → all `Already up to date.`
-- `gh -R jpbaking/rusty-conduit-switch run view 45700865218 --json status,conclusion,headSha` → `completed` / `success` (`93398fcc55e90473ef0ebeb0bfa51576a0cad0ae`)
-- `git -C ../rusty-conduit-switch ls-remote --tags origin v0.0.1-beta.2` → `8ee5c3948d18c5fb1bdf27840c8ca02727b7fe94	refs/tags/v0.0.1-beta.2`
-- `gh -R jpbaking/rusty-conduit-switch run watch 45702789898 --exit-status -i 15` → `completed` / `success` (`v0.0.1-beta.2`)
-- `## Verify` command (`gh run view 45701315242`, `gh run view 45701367206`, `gh run list --workflow=release.yml`) → exit 0 (`PHASE_0001_VERIFY=PASS`)
+- `cargo build --locked && ! grep -n 'TcpListener::bind(addr)' src/server.rs` → exit 0 (`Finished dev profile`, no `TcpListener::bind(addr)` matches)
+- `cargo test --locked --lib server::tests::listen && cargo test --locked --lib server::tests::listeners_keep` → exit 0 (2 passed: `listen_backlog_is_4096`, `listeners_keep_reuse_address`; then 1 passed: `listeners_keep_reuse_address`)
+- `cargo test --locked --lib server::tests::backlog` → exit 0 (0 passed on macOS; `#[cfg(target_os = "linux")]` test compiled out as expected)
+- `cargo test --locked --lib server::tests::binds_ipv6` → exit 0 (1 passed: `binds_ipv6_loopback`)
+- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py && ! grep -n 'TcpListener::bind(addr)' src/server.rs` → exit 0 (fmt ok, clippy default & no-default-features ok, tests default: 164 unit + 4 integration passed, no-default-features: 153 unit + 3 integration passed, `PURE_RUST_CRYPTO_OK`, no `TcpListener::bind(addr)` matches)
+- planner fix-up after review: the backlog test now asserts all 300 connections queued (`> 128` also passed with the old backlog, because Linux queues backlog + 1)

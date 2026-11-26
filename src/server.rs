@@ -25,7 +25,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -43,6 +43,25 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pause after a failed `accept()` (e.g. file-descriptor exhaustion) to avoid a hot loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Listen backlog requested for every listener. The kernel caps it at its own limit
+/// (`net.core.somaxconn` on Linux, `kern.ipc.somaxconn` on macOS); `TcpListener::bind`
+/// would request only 128.
+pub const LISTEN_BACKLOG: u32 = 4096;
+
+/// Bind `addr` like `TcpListener::bind` (with `SO_REUSEADDR` on non-Windows platforms),
+/// but request a listen backlog of [`LISTEN_BACKLOG`].
+fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_BACKLOG)
+}
 
 /// Boxed future returned by protocol handlers.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
@@ -360,7 +379,7 @@ impl Server {
         let mut listeners = Vec::with_capacity(wanted.len());
         for (role, addr) in wanted {
             let bind_err = |source| ServerError::Bind { role, addr, source };
-            let listener = TcpListener::bind(addr).await.map_err(bind_err)?;
+            let listener = bind_listener(addr).map_err(bind_err)?;
             let local = listener.local_addr().map_err(bind_err)?;
             listeners.push((role, local, listener));
         }
@@ -1043,5 +1062,84 @@ mod tests {
 
         token.cancel();
         assert!(run.await.unwrap().drained);
+    }
+
+    #[test]
+    fn listen_backlog_is_4096() {
+        assert_eq!(LISTEN_BACKLOG, 4096);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listeners_keep_reuse_address() {
+        let server = Server::bind(
+            ListenPlan::Separate {
+                http: Some(loopback(0)),
+                socks: None,
+            },
+            Arc::new(StubHandlers::new(quiet())),
+            quiet(),
+        )
+        .await
+        .unwrap();
+        assert!(socket2::SockRef::from(&server.listeners[0].2)
+            .reuse_address()
+            .unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn backlog_queues_more_than_128_connections() {
+        let Ok(raw) = std::fs::read_to_string("/proc/sys/net/core/somaxconn") else {
+            return;
+        };
+        let Ok(somaxconn) = raw.trim().parse::<usize>() else {
+            return;
+        };
+        if somaxconn < 300 {
+            return;
+        }
+        let server = Server::bind(
+            ListenPlan::Separate {
+                http: Some(loopback(0)),
+                socks: None,
+            },
+            Arc::new(StubHandlers::new(quiet())),
+            quiet(),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_http_addr().unwrap();
+        let mut streams = Vec::with_capacity(300);
+        for _ in 0..300 {
+            match tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => streams.push(stream),
+                _ => break,
+            }
+        }
+        // Linux queues backlog + 1 connections, so the old backlog of 128 would stop at 129.
+        assert_eq!(
+            streams.len(),
+            300,
+            "expected all 300 connections to queue (somaxconn={somaxconn})"
+        );
+    }
+
+    #[tokio::test]
+    async fn binds_ipv6_loopback() {
+        let Ok(_probe) = TcpListener::bind("[::1]:0").await else {
+            return; // IPv6 loopback unavailable on this host.
+        };
+        let server = Server::bind(
+            ListenPlan::Separate {
+                http: Some("[::1]:0".parse().unwrap()),
+                socks: None,
+            },
+            Arc::new(StubHandlers::new(quiet())),
+            quiet(),
+        )
+        .await
+        .unwrap();
+        assert!(server.local_http_addr().unwrap().is_ipv6());
     }
 }

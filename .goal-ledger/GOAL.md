@@ -1,50 +1,55 @@
-# GOAL — Complete Milestone E5 CLI Releases
+# GOAL — Raise the engine listen backlog to 4096
 
 ## Goal
-- Goal ID: 20261126-e5-cli-releases
-- Outcome: Finish tagging, verifying Release workflows (including multi-arch GHCR Docker images), and publishing meaningful divergence-ledger release notes for `rusty-conduit-switch` (`v0.0.1-beta.2`), `rusty-conduit` (`v1.3.0`), and `rusty-conduit-ssh` (`v1.4.0`).
-- Done when: All three CLI Release workflows succeed on GitHub Actions and all three GitHub Releases have updated release notes containing their `docs/DIVERGENCE-LEDGER.md` entries.
+- Goal ID: 20261126-listen-backlog
+- Outcome: Every engine listener requests a listen backlog of 4096 instead of the 128 that `tokio::net::TcpListener::bind` (via mio/std) hard-codes, so the kernel's own cap (`net.core.somaxconn`, `kern.ipc.somaxconn`) decides the queue length, and the change is recorded in the divergence ledger.
+- Done when: the six CI checks in `## Execution` pass; `src/server.rs` binds through a helper that keeps `SO_REUSEADDR` on non-Windows and listens with `LISTEN_BACKLOG = 4096`; on Linux with `somaxconn >= 300` the new test queues all 300 connections before the first accept (the old backlog stops at 129, because Linux queues backlog + 1); `docs/DIVERGENCE-LEDGER.md` has the entry; no version bump and no tag (the release is a separate step the user approves).
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
 - Last completed phase: phase-0002
 
 ## Execution
-- Execution mode: solo
-- Planner tier: primary session
-- Executor tier: same
-- Full verification: gh -R jpbaking/rusty-conduit-switch release view v0.0.1-beta.2 --json tagName,body && gh -R jpbaking/rusty-conduit release view v1.3.0 --json tagName,body && gh -R jpbaking/rusty-conduit-ssh release view v1.4.0 --json tagName,body
+- Execution mode: delegated
+- Planner tier: Claude Code (claude-opus-5-5)
+- Executor tier: agy --model gemini-4-neon-medium via the herdr-subagent skill
+- Full verification: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py
 
 ## Git
 - Repository: yes
-- Strategy: current-branch
+- Strategy: isolated-branch
 - Starting branch: main
-- Work branch: main
-- Baseline commit: bc05012d78a9e037df0d2e7f7c601974825d1482
-- Starting upstream at start: origin/main@bc05012d78a9e037df0d2e7f7c601974825d1482
-- Work upstream at start: origin/main@bc05012d78a9e037df0d2e7f7c601974825d1482
+- Work branch: goal/20261126-listen-backlog
+- Baseline commit: 1b67956fe540c920a985a0b311b77e0b1c5629ed
+- Starting upstream at start: origin/main@1b67956fe540c920a985a0b311b77e0b1c5629ed
+- Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — Confirm rusty-conduit-switch CI, tag v0.0.1-beta.2, and watch all 3 Release workflows
-- [done] phase-0002 — Update GitHub Release notes for all 3 CLIs with divergence ledger entries
+- [done] phase-0001 — Bind listeners with a 4096 backlog
+- [done] phase-0002 — Record the change in the divergence ledger and DOX
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: user accepted goal after Gate D pass; all 3 CLI Release workflows succeeded (`#45701315242`, `#45701367206`, `#45702789898`) and all 3 GitHub Releases updated with `rusty-conduit-engine v0.2.0` & divergence ledger entries; validator 0 warnings; history preserved (no automated squash because `origin/main` advanced to `3b55f18` on `current-branch`)
+- Last verified evidence: planner Gate D full verification on 484799e passed (fmt, clippy x2, tests 164 + 153 unit, PURE_RUST_CRYPTO_OK); phase-0002 executor: grep M section & M-01 in docs/DIVERGENCE-LEDGER.md, grep LISTEN_BACKLOG in DOX.md, git diff --exit-code -- src tests Cargo.toml Cargo.lock, cargo test --locked (164 unit + 4 integration) all passed
 - Blockers: none
 
 ## Review
-- Reviewed by: planner (primary session)
-- Verification result: pass — `gh release view` Full verification succeeded for `rusty-conduit-switch` `v0.0.1-beta.2`, `rusty-conduit` `v1.3.0`, and `rusty-conduit-ssh` `v1.4.0`; all 3 Release workflows confirmed `completed/success`; validator passed (2 phases, 0 warnings)
-- Diff reviewed: `bc05012..7b34b93` (read in full; 5 matching Goal-ID commits, strictly `.goal-ledger/**` changes only)
-- Findings: none
+- Reviewed by: planner (claude-opus-5-5)
+- Verification result: full verification passed on macOS arm64; the Linux-only backlog test compiles out here and first runs in CI
+- Diff reviewed: 1b67956..484799e (src/server.rs, DOX.md, docs/DIVERGENCE-LEDGER.md, ledger)
+- Findings: one, fixed in 6dbd36f: the backlog test's `> 128` bound also passed with the old backlog (Linux queues backlog + 1), so it now requires all 300; no version bump or tag in range
 
 ## Log
-- created E5 handoff ledger after completing E0–E4, releasing rusty-conduit-engine v0.2.0, merging all 3 CLIs to main, and tagging rusty-conduit v1.3.0 and rusty-conduit-ssh v1.4.0
-- resumed goal as planner: verified `main` at `3b55f18` (clean tree, baseline `bc05012` ancestor, 1 matching Goal-ID commit, validator clean; noted `origin/main` published at `3b55f18` so automated squash is unavailable); beginning `phase-0001`
-- closed phase-0001: tagged & pushed `rusty-conduit-switch` `v0.0.1-beta.2` (`8ee5c3948d18`), all 3 CLI Release workflows (`#45701315242`, `#45701367206`, `#45702789898`) verified `success`
-- began phase-0002: updating GitHub Release notes for all 3 CLIs with divergence ledger entries
-- closed phase-0002: all 3 GitHub Releases updated and verified; entering Gate D (`in-review`)
-- Gate D review passed (0 findings, validator 0 warnings); transitioned to `awaiting-acceptance`
-- accepted by user; marked `completed` and preserved commit history (`goal-ledger(complete)`)
+- created ledger with 2 phases; replaces the completed ledger 20261126-e5-cli-releases (kept in Git history)
+- user decision (CLI consistency goal): listen-backlog/somaxconn is its own engine goal; no releases yet
+- planner prototype (tokio 1.54.1, socket2 0.6): TcpSocket + set_reuseaddr + listen(4096) binds v4 and v6, keeps SO_REUSEADDR, still reports AddrInUse for a taken port; on macOS (kern.ipc.somaxconn=128) exactly 128 connections queue before accept
+- follow-up after this goal (separate, needs the user's go-ahead): `chore: release v0.4.0` + tag, then bump the pin in rusty-conduit, rusty-conduit-ssh, rusty-conduit-switch, and rusty-conduit-gui and document somaxconn tuning in their sizing guides
+- user approved the goal, the branch, and execution ("approved, create the branch, and go"); created goal/20261126-listen-backlog from main
+- delegated phase-0001 to the executor
+- phase-0001 completed by executor: bound listeners with LISTEN_BACKLOG = 4096 and added unit tests; full verification passed
+- planner review of phase-0001: accepted; tightened backlog_queues_more_than_128_connections from `> 128` to `== 300`, since Linux accepts backlog + 1 and the old code would have reached 129
+- delegated phase-0002 to the executor
+- phase-0002 completed by executor: recorded M-01 in docs/DIVERGENCE-LEDGER.md and updated DOX.md Feature Map; verification passed
+- Gate D passed; goal awaiting the user's acceptance
+- user accepted ("accept, squash, and push engine main"); squashed onto main as one commit; the per-phase history stays on goal/20261126-listen-backlog

@@ -69,3 +69,11 @@ differences in `-ssh`. Each will get its own entry below.
 | E4-02 | `net`, `upstream` | `-ssh` | `-ssh` keeps `TunnelState` and `Socks5UpstreamDialer` in a thin `src/net.rs`, implementing `rusty_conduit_engine::upstream::UpstreamDialer` (`UpstreamStream::Tcp`, typed `DialError::NotConnected`/`Timeout`) and registering it as an API-only `ProfileType::External` profile (`ssh-tunnel`). Forward `HostFilter` runs in the router without local DNS, matching former `FilteredDialer`. | keep | E4 (`7b6daa4`) |
 | E4-03 | `reverse`, `server`, `filter` | `-ssh` | `ReverseProxy` is rebuilt as a second engine `Server` with a direct-egress `RoutingState` and its reverse `HostFilter` passed via `DialerOptions` only (so IP/CIDR-only allowlists check resolved IPs at dial time, verified by `reverse_filter_checks_resolved_ips_for_hostnames`). | keep | E4 (`7b6daa4`) |
 | E4-04 | `http`, `socks`, `mitm` | `-ssh` | Status/reply mapping now flows through typed `DialError` with identical HTTP (`403`/`502`/`504`) and SOCKS (`0x01`–`0x05`) codes; `MitmState` dials through routing instead of taking a dialer directly. Inherits E2 CA-loader fixes (`E2-01`, `E2-02`). | keep / fix | E4 (`7b6daa4`) |
+
+## M — Maintenance after the CLI ports
+
+Engine changes made after E5 that change behaviour every consumer inherits.
+
+| ID | Module | Consumers | Difference | Decision | Landed |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| M-01 | `server` | all | Listeners are now bound through `bind_listener`, which requests a listen backlog of `LISTEN_BACKLOG` (4096) instead of the 128 that `TcpListener::bind` requests. The kernel still caps it (`net.core.somaxconn`, 4096 by default on Linux ≥ 5.4; `kern.ipc.somaxconn`, 128 by default on macOS). `SO_REUSEADDR` stays on for non-Windows platforms. Connection bursts larger than 128 no longer overflow the queue on Linux. | keep | `src/server.rs` (`bind_listener`, `backlog_queues_more_than_128_connections`) |

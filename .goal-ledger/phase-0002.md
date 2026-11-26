@@ -1,43 +1,44 @@
-# phase-0002 — Update GitHub Release notes for all 3 CLIs with divergence ledger entries
+# phase-0002 — Record the change in the divergence ledger and DOX
 
 - Status: done
-- Owner: planner
+- Owner: executor
 - Depends on: phase-0001
-- Goal: Edit the auto-generated GitHub Release notes for `rusty-conduit-switch` (`v0.0.1-beta.2`), `rusty-conduit` (`v1.3.0`), and `rusty-conduit-ssh` (`v1.4.0`) to include clear summaries of the `rusty-conduit-engine v0.2.0` migration and each CLI's entries from `docs/DIVERGENCE-LEDGER.md`.
-- Done when: All three GitHub Releases contain meaningful release notes referencing `rusty-conduit-engine v0.2.0` and their relevant `docs/DIVERGENCE-LEDGER.md` fixes/notes.
-- Pattern to follow: `docs/DIVERGENCE-LEDGER.md:22-80`
+- Goal: Record the backlog change as a divergence-ledger entry and in the DOX Feature Map, as the engine's DOX contract requires.
+- Done when: every command in `## Verify` exits 0.
+- Pattern to follow: `docs/DIVERGENCE-LEDGER.md` section `## E4 — Port \`rusty-conduit-ssh\`` (table header and row format)
 
 ## Context
-Each CLI's `release.yml` creates a GitHub Release with `--generate-notes` once binaries are built. Master Plan §6 E5 requires publishing each CLI's divergence ledger entries in its release changelog:
-- `rusty-conduit-switch` `v0.0.1-beta.2`: E1 extraction onto `rusty-conduit-engine v0.2.0`, E2 MITM CA loader fixes (LibreSSL explicit P-256/P-384 EC params + PBES2 HMAC-SHA1 hint), `RoutingCounters` preserved across hot-reload, zero user-visible CLI/routing change.
-- `rusty-conduit` `v1.3.0`: E3 migration onto `rusty-conduit-engine v0.2.0` (`default-features = false`), E2 MITM CA loader fixes, unchanged v1.2.0 access-log schema & DNS+IP allowlist behavior, unified `400` bad-CONNECT message and diagnostic wording.
-- `rusty-conduit-ssh` `v1.4.0`: E4 migration onto `rusty-conduit-engine v0.2.0` (`default-features = false`), E2 MITM CA loader fixes, `Socks5UpstreamDialer` wired as external profile + `ReverseProxy` on engine `Server`, unchanged v1.3.0 `direction=forward|reverse` access-log schema.
+The engine's `DOX.md` requires an entry in `docs/DIVERGENCE-LEDGER.md` for any change to behaviour a consumer relied on. Every consumer (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, `rusty-conduit-gui`) binds through `Server::bind`, so all of them get the new backlog when they move to the next engine tag. The decision is `keep`: it becomes engine behaviour for everyone, with no option. Do not bump the version in `Cargo.toml` and do not edit `CHANGELOG`-style files; the release is a separate step.
 
 ## Scope
-- In: `.goal-ledger/**`, GitHub Releases via `gh release edit` on `jpbaking/rusty-conduit-switch`, `jpbaking/rusty-conduit`, and `jpbaking/rusty-conduit-ssh`
-- Out: application source code or git tags
+- In: `docs/DIVERGENCE-LEDGER.md`, `DOX.md`
+- Out: `src/`, `tests/`, `Cargo.toml`, `Cargo.lock`, `docs/MASTER-PLAN.md`, every other file
 
 ## Sub-tasks
-1. [done] Update `jpbaking/rusty-conduit-switch` release `v0.0.1-beta.2` notes via `gh release edit` — done when: `gh -R jpbaking/rusty-conduit-switch release view v0.0.1-beta.2 --json body -q .body | grep -q "rusty-conduit-engine"`
-2. [done] Update `jpbaking/rusty-conduit` release `v1.3.0` notes via `gh release edit` — done when: `gh -R jpbaking/rusty-conduit release view v1.3.0 --json body -q .body | grep -q "rusty-conduit-engine"`
-3. [done] Update `jpbaking/rusty-conduit-ssh` release `v1.4.0` notes via `gh release edit` — done when: `gh -R jpbaking/rusty-conduit-ssh release view v1.4.0 --json body -q .body | grep -q "rusty-conduit-engine"`
+1. [done] Append to the end of `docs/DIVERGENCE-LEDGER.md` a section `## M — Maintenance after the CLI ports` with one sentence of intro (`Engine changes made after E5 that change behaviour every consumer inherits.`), the same six-column table header as the E4 section, and one row: ID `M-01`, Module `` `server` ``, Consumers `all`, Difference `` Listeners are now bound through `bind_listener`, which requests a listen backlog of `LISTEN_BACKLOG` (4096) instead of the 128 that `TcpListener::bind` requests. The kernel still caps it (`net.core.somaxconn`, 4096 by default on Linux ≥ 5.4; `kern.ipc.somaxconn`, 128 by default on macOS). `SO_REUSEADDR` stays on for non-Windows platforms. Connection bursts larger than 128 no longer overflow the queue on Linux. ``, Decision `keep`, Landed `` `src/server.rs` (`bind_listener`, `backlog_queues_more_than_128_connections`) `` — done when: `grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md` prints one line.
+2. [done] In `DOX.md`, edit only the `## Feature Map` bullet **Listeners and graceful shutdown**: after `connection limits,` insert `a 4096 listen backlog (\`LISTEN_BACKLOG\`, capped by the kernel's somaxconn),` — done when: `grep -n 'LISTEN_BACKLOG' DOX.md` prints one line.
 
 ## Verify
 ```sh
-gh -R jpbaking/rusty-conduit-switch release view v0.0.1-beta.2 --json body -q .body | grep -q "rusty-conduit-engine" && gh -R jpbaking/rusty-conduit release view v1.3.0 --json body -q .body | grep -q "rusty-conduit-engine" && gh -R jpbaking/rusty-conduit-ssh release view v1.4.0 --json body -q .body | grep -q "rusty-conduit-engine"
+grep -n '^## M — Maintenance after the CLI ports' docs/DIVERGENCE-LEDGER.md
+grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md
+grep -n 'LISTEN_BACKLOG' DOX.md
+git diff --exit-code -- src tests Cargo.toml Cargo.lock
+cargo test --locked
 ```
 
 ## Escalate when
-- Any of the three GitHub Releases does not exist yet → stop, check the corresponding Release workflow
+- The ledger's existing table format differs from six columns → stop, set Status: needs-human — reason: paste the header line.
+- The Feature Map bullet text differs from `separate or single-port listeners, connection dispatch, connection limits, drain-on-shutdown` → stop, set Status: needs-human — reason: paste the current bullet.
 
 ## Log
 - (append-only, one line per event)
-- began phase-0002
-- sub-tasks 1–3 done & phase verified: updated GitHub Release notes for `rusty-conduit-switch` `v0.0.1-beta.2`, `rusty-conduit` `v1.3.0`, and `rusty-conduit-ssh` `v1.4.0` with `rusty-conduit-engine v0.2.0` migration summaries and `docs/DIVERGENCE-LEDGER.md` entries; `## Verify` passed
+- sub-task 1: appended section `## M — Maintenance after the CLI ports` and row `M-01` to `docs/DIVERGENCE-LEDGER.md`
+- sub-task 2: updated `## Feature Map` bullet **Listeners and graceful shutdown** in `DOX.md`
+- verify: ran all `## Verify` commands; all passed
 
 ## Evidence
 - (append-only: command → observed result)
-- `gh -R jpbaking/rusty-conduit-switch release edit v0.0.1-beta.2 --notes-file -` → `https://github.com/jpbaking/rusty-conduit-switch/releases/tag/v0.0.1-beta.2`
-- `gh -R jpbaking/rusty-conduit release edit v1.3.0 --notes-file -` → `https://github.com/jpbaking/rusty-conduit/releases/tag/v1.3.0`
-- `gh -R jpbaking/rusty-conduit-ssh release edit v1.4.0 --notes-file -` → `https://github.com/jpbaking/rusty-conduit-ssh/releases/tag/v1.4.0`
-- `## Verify` (`gh release view ... | grep -q "rusty-conduit-engine"` across all 3 repos) → exit 0 (`PHASE_0002_VERIFY=PASS`)
+- `grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md` → exit 0 (1 line at line 79)
+- `grep -n 'LISTEN_BACKLOG' DOX.md` → exit 0 (1 line at line 244)
+- `grep -n '^## M — Maintenance after the CLI ports' docs/DIVERGENCE-LEDGER.md && grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md && grep -n 'LISTEN_BACKLOG' DOX.md && git diff --exit-code -- src tests Cargo.toml Cargo.lock && cargo test --locked` → exit 0 (line 73 heading, line 79 M-01 row, line 244 DOX bullet, no diff in src/tests/Cargo.*, 164 unit + 4 integration tests passed)

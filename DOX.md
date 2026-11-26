@@ -241,7 +241,7 @@ When the user requests a durable behavior change, record it here or in the relev
 ## Feature Map
 
 - **Crate entry and module layout** — public module tree and crate docs. Start: `src/lib.rs`. Files: `Cargo.toml`.
-- **Listeners and graceful shutdown** — separate or single-port listeners, connection dispatch, connection limits, drain-on-shutdown (`Server`, `EngineHandlers`, `ShutdownReport`). Start: `src/server.rs`. Files: `src/mux.rs`.
+- **Listeners and graceful shutdown** — separate or single-port listeners, connection dispatch, connection limits, a 4096 listen backlog (`LISTEN_BACKLOG`, capped by the kernel's somaxconn), drain-on-shutdown (`Server`, `EngineHandlers`, `ShutdownReport`). Start: `src/server.rs`. Files: `src/mux.rs`.
 - **Single-port protocol sniffing** — classifies a connection as HTTP, SOCKS4, or SOCKS5 by peeking its first byte. Start: `src/mux.rs`.
 - **HTTP/HTTPS proxy engine** — HTTP forward proxy, opaque `CONNECT` tunnel, and the MITM interception path. Start: `src/http/mod.rs`. Detail in ./src/http.
 - **SOCKS4/4a/5 proxy engine** — TCP `CONNECT` server with the relay-guard hook and SOCKS web blocking. Start: `src/socks/mod.rs`. Detail in ./src/socks.
