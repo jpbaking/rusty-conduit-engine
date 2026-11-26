@@ -220,6 +220,7 @@ When the owning doc lies inside a nested root, make the update there — but say
 - **Scope.** This repository only. Consumers live in sibling repositories; never edit them from here. Development happens on `main`.
 - **No CLI concerns.** No argument parsing, config-file loading, file watching, signal handling, or SSH process supervision. Do not add `clap`, `notify`, or a non-dev `toml` dependency. The CLIs deserialize their own config formats into the serde types in `src/routing.rs`.
 - **Pure-Rust crypto.** TLS and certificates use `rustls` with the `ring` provider, plus `rcgen`, `x509-parser`, and `p12-keystore`. `openssl-sys` and `aws-lc-sys` must never enter the normal dependency graph on any target. `scripts/check-pure-rust-crypto.py` enforces this.
+- **Releases.** Tag `vX.Y.Z` with an annotated tag whose message body is the release notes (`git tag -a vX.Y.Z -F notes.md`). Pushing the tag runs `.github/workflows/release.yml`, which re-runs verification and creates the GitHub Release from that body. Follow the workspace's engine release order when one applies.
 - **`routing` cargo feature (default on).** It gates `regex`. Every module must still build and pass tests with `--no-default-features`. Regex-based conditions then fail to compile with an error that names the `routing` feature.
 - **No hidden caches.** Every dial resolves DNS afresh: no DNS cache, no connection pooling. The MITM leaf-certificate cache (`src/mitm/cache.rs`) is the only cache in the engine.
 - **Credentials stay secret.** Credentials, private keys, and passphrases never appear in `Debug` output, logs, or error strings. The `upstream` field of access records is always redacted.
@@ -258,6 +259,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **`routing` cargo feature gate** — regex-based rule matching behind the default-on feature. Start: `Cargo.toml`. Files: `src/router/condition.rs`.
 - **Pure-Rust crypto policy check** — fails if `openssl-sys` or `aws-lc-sys` is in the dependency graph. Start: `scripts/check-pure-rust-crypto.py`. Files: `Cargo.toml`, `Cargo.lock`.
 - **Continuous integration** — format, clippy, no-default-features, crypto policy, and the test matrix on Linux, macOS, and Windows. Start: `.github/workflows/ci.yml`.
+- **Release** — on a `v*` tag, re-runs verification and creates the GitHub Release from the annotated tag's message body. Start: `.github/workflows/release.yml`.
 - **Integration tests** — end-to-end tests of counters, the custom resolver, and MITM. Start: `tests/traffic_counters.rs`. Files: `tests/route_resolver.rs`, `tests/mitm_counters.rs`.
 - **Divergence ledger and open items** — recorded differences from each consumer's former copy and engine changes every consumer inherits, plus open decisions. Start: `docs/DIVERGENCE-LEDGER.md`. Files: `docs/TODO.md`.
 

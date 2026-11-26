@@ -1,0 +1,62 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --no-default-features --locked
+      - run: python3 scripts/check-pure-rust-crypto.py
+
+  release:
+    name: Create GitHub Release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release notes are the body of the annotated tag (everything after its subject
+      # line), written with `git tag -a vX.Y.Z -F notes.md`. Without a body, GitHub generates
+      # the notes instead.
+      - name: Create the release from the tag message
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; nothing to do."
+            exit 0
+          fi
+          # actions/checkout stores the tag without its annotation; fetch the tag object.
+          git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+          git tag -l --format='%(contents:body)' "${TAG}" > notes.md
+          if [ -s notes.md ] && grep -q '[^[:space:]]' notes.md; then
+            gh release create "${TAG}" --verify-tag \
+              --title "rusty-conduit-engine ${TAG}" \
+              --notes-file notes.md
+          else
+            gh release create "${TAG}" --verify-tag \
+              --title "rusty-conduit-engine ${TAG}" \
+              --generate-notes
+          fi
