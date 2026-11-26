@@ -1,6 +1,6 @@
 [package]
 name = "rusty-conduit-engine"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Shared proxy and routing engine for the rusty-conduit CLI family (pure-Rust TLS/crypto)"
 license = "BSD-3-Clause"
