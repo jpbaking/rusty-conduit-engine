@@ -24,7 +24,12 @@
 //!   HTTP: the route is resolved **once** at `CONNECT` time, the upstream is dialed before the
 //!   client handshake (so the client sees exactly the ALPN protocol, `h2` or `http/1.1`, the
 //!   origin chose), and that upstream TLS connection is reused for every request on the
-//!   tunnel (an HTTP/1.1 connection that closes is redialed through the same decision).
+//!   tunnel. An upstream connection that closes (HTTP/1.1 close, HTTP/2 GOAWAY, reset) is
+//!   redialed through the same decision on the next request, so the client connection
+//!   outlives it. Over HTTP/2, a request the origin dropped unanswered is resent once on
+//!   the new connection if it was never written, or if it is idempotent and has no body;
+//!   if a redial no longer negotiates `h2`, the requests in hand go out over HTTP/1.1 and
+//!   the client is sent GOAWAY so it reconnects. `te: trailers` is kept on HTTP/2.
 //! * **URL-level rules present**: every decrypted request is routed with its full
 //!   `https://host/path?query` URL. The tunnel speaks HTTP/1.1 to the client and upstream
 //!   connections are dialed lazily; a request whose decision resolves to a different
@@ -45,7 +50,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Empty};
-use hyper::body::Incoming;
+use hyper::body::{Body as _, Incoming};
 use hyper::client::conn::{http1 as client_http1, http2 as client_http2};
 use hyper::header::{self, HeaderValue};
 use hyper::server::conn::{http1 as server_http1, http2 as server_http2};
@@ -86,6 +91,13 @@ use crate::upstream::UpstreamStream;
 /// Bound on the client and upstream TLS handshakes.
 pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Largest HTTP/2 header block accepted from the client and from the origin (HPACK-decoded
+/// size, `SETTINGS_MAX_HEADER_LIST_SIZE`). hyper's 16 KiB default is smaller than what
+/// browsers accept (Chrome advertises 256 KiB), and real sites exceed it (long
+/// `content-security-policy` and `set-cookie` headers), so a stricter proxy would fail
+/// pages a browser loads directly.
+pub const H2_MAX_HEADER_LIST_SIZE: u32 = 256 * 1024;
+
 const ALPN_H2: &[u8] = b"h2";
 const ALPN_HTTP11: &[u8] = b"http/1.1";
 
@@ -93,6 +105,7 @@ const ALPN_HTTP11: &[u8] = b"http/1.1";
 type UpstreamTls = ClientTlsStream<UpstreamStream>;
 type ClientTls = tokio_rustls::server::TlsStream<TokioIo<Upgraded>>;
 type H1Sender = client_http1::SendRequest<ProxyBody>;
+type H2Sender = client_http2::SendRequest<ProxyBody>;
 
 /// Upstream TLS client config using the OS / platform certificate verifier.
 pub fn platform_client_config(
@@ -508,6 +521,48 @@ struct H1Upstream {
     info: RouteInfo,
 }
 
+/// The upstream side of an HTTP/2 tunnel: one multiplexed connection, redialed through
+/// the tunnel's fixed decision when the origin closes it (GOAWAY, idle timeout, reset),
+/// so the client's HTTP/2 connection outlives any one upstream connection.
+struct H2Tunnel {
+    decision: Arc<RouteDecision>,
+    slot: Mutex<H2Slot>,
+    /// Signalled when a redial no longer negotiates `h2`: the client connection is then
+    /// shut down gracefully (GOAWAY) so the client reconnects with a fresh `CONNECT`.
+    goaway: tokio::sync::Notify,
+}
+
+struct H2Slot {
+    /// Bumped on every redial, so a request that saw one connection fail only retires that
+    /// connection, never a newer one.
+    generation: u64,
+    upstream: H2Upstream,
+}
+
+enum H2Upstream {
+    /// The current connection (it may since have closed: checked before each use).
+    Open { sender: H2Sender, info: RouteInfo },
+    /// Retired: the next request redials.
+    Closed,
+    /// A redial came back without `h2`. The client was sent GOAWAY; requests still
+    /// arriving on it go out over one-off HTTP/1.1 connections.
+    Downgraded,
+}
+
+/// The upstream a decrypted HTTP/2 request goes out on.
+enum H2Pick {
+    H2 {
+        sender: H2Sender,
+        info: RouteInfo,
+        generation: u64,
+    },
+    /// A dedicated HTTP/1.1 connection (origin no longer negotiates `h2`).
+    H1 {
+        tls: Box<UpstreamTls>,
+        info: RouteInfo,
+    },
+}
+
 /// How a tunnel picks the upstream for each request.
 #[derive(Clone)]
 enum Routing {
@@ -726,11 +781,15 @@ impl MitmInterceptor {
         };
 
         // 4. Serve decrypted HTTP.
-        let result = match upstream {
-            Some(up) if negotiated.as_deref() == Some(ALPN_H2) => {
-                session.serve_h2(client_tls, up).await
+        let fixed = match &session.routing {
+            Routing::Fixed { decision, info } => Some((Arc::clone(decision), info.clone())),
+            Routing::PerRequest(_) => None,
+        };
+        let result = match (upstream, fixed) {
+            (Some(up), Some((decision, info))) if negotiated.as_deref() == Some(ALPN_H2) => {
+                session.serve_h2(client_tls, up, decision, info).await
             }
-            up => session.serve_h1(client_tls, up).await,
+            (up, _) => session.serve_h1(client_tls, up).await,
         };
         if let Err(e) = result {
             logger.debug(format!("MITM session {client} -> {target} ended: {e}"));
@@ -997,8 +1056,10 @@ impl Session {
         let mut resp = match up.sender.send_request(upstream_req).await {
             Ok(r) => r,
             Err(e) => {
-                self.logger
-                    .error(format!("MITM upstream request to {authority} failed: {e}"));
+                self.logger.error(format!(
+                    "MITM upstream request to {authority} failed: {}",
+                    error_chain(&e)
+                ));
                 guard.set_status(StatusCode::BAD_GATEWAY);
                 return self.error(
                     StatusCode::BAD_GATEWAY,
@@ -1062,48 +1123,145 @@ impl Session {
         });
     }
 
-    /// HTTP/2 to client and upstream (fixed routing only: one multiplexed upstream).
+    /// HTTP/2 to client and upstream (fixed routing only). The upstream connection is
+    /// redialed when the origin closes it; see [`H2Tunnel`].
     async fn serve_h2(
         &self,
         client_tls: ClientTls,
         upstream: UpstreamTls,
+        decision: Arc<RouteDecision>,
+        info: RouteInfo,
     ) -> Result<(), hyper::Error> {
-        let info = match &self.routing {
-            Routing::Fixed { info, .. } => info.clone(),
-            Routing::PerRequest(_) => RouteInfo::default(),
-        };
-        let (sender, conn) =
-            client_http2::handshake(TokioExecutor::new(), TokioIo::new(upstream)).await?;
-        self.spawn_driver("HTTP/2", conn);
+        let sender = self.h2_handshake(upstream).await?;
+        let tunnel = Arc::new(H2Tunnel {
+            decision,
+            slot: Mutex::new(H2Slot {
+                generation: 0,
+                upstream: H2Upstream::Open { sender, info },
+            }),
+            goaway: tokio::sync::Notify::new(),
+        });
         let session = self.clone();
+        let shared = Arc::clone(&tunnel);
         let service = service_fn(move |req| {
             let session = session.clone();
-            let sender = sender.clone();
-            let info = info.clone();
-            async move { Ok::<_, Infallible>(session.forward_h2(req, sender, &info).await) }
+            let tunnel = Arc::clone(&shared);
+            async move { Ok::<_, Infallible>(session.forward_h2(req, &tunnel).await) }
         });
         let conn = server_http2::Builder::new(TokioExecutor::new())
+            .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
             .serve_connection(TokioIo::new(client_tls), service);
         let mut conn = std::pin::pin!(conn);
         tokio::select! {
-            res = conn.as_mut() => res,
-            () = self.shutdown.cancelled() => {
-                conn.as_mut().graceful_shutdown();
-                conn.as_mut().await
+            res = conn.as_mut() => return res,
+            () = self.shutdown.cancelled() => {}
+            () = tunnel.goaway.notified() => {}
+        }
+        conn.as_mut().graceful_shutdown();
+        conn.as_mut().await
+    }
+
+    async fn h2_handshake(&self, tls: UpstreamTls) -> Result<H2Sender, hyper::Error> {
+        let (sender, conn) = client_http2::Builder::new(TokioExecutor::new())
+            .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
+            .handshake(TokioIo::new(tls))
+            .await?;
+        self.spawn_driver("HTTP/2", conn);
+        Ok(sender)
+    }
+
+    /// The upstream for the next request on an HTTP/2 tunnel: the current connection if it
+    /// is still open, otherwise a new one dialed through the tunnel's decision. A redial
+    /// that no longer negotiates `h2` asks the client to reconnect (GOAWAY) and serves the
+    /// request over HTTP/1.1.
+    async fn h2_pick(&self, tunnel: &H2Tunnel) -> Result<H2Pick, DialFailure> {
+        let mut slot = tunnel.slot.lock().await;
+        match &slot.upstream {
+            H2Upstream::Open { sender, info } if !sender.is_closed() => {
+                return Ok(H2Pick::H2 {
+                    sender: sender.clone(),
+                    info: info.clone(),
+                    generation: slot.generation,
+                });
+            }
+            H2Upstream::Downgraded => {
+                drop(slot);
+                let (tls, info) = self
+                    .dialer
+                    .connect(&tunnel.decision, vec![ALPN_HTTP11.to_vec()])
+                    .await?;
+                return Ok(H2Pick::H1 {
+                    tls: Box::new(tls),
+                    info,
+                });
+            }
+            H2Upstream::Open { .. } | H2Upstream::Closed => {}
+        }
+        // Dial while holding the slot, so concurrent requests share the new connection.
+        let target = &self.dialer.target;
+        self.logger.debug(format!(
+            "MITM upstream HTTP/2 connection to {target} closed; redialing"
+        ));
+        let (tls, info) = self
+            .dialer
+            .connect(
+                &tunnel.decision,
+                vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()],
+            )
+            .await?;
+        slot.generation += 1;
+        if tls.get_ref().1.alpn_protocol() != Some(ALPN_H2) {
+            self.logger.info(format!(
+                "MITM upstream {target} no longer negotiates HTTP/2; asking client {} to \
+                 reconnect",
+                self.client
+            ));
+            slot.upstream = H2Upstream::Downgraded;
+            tunnel.goaway.notify_one();
+            return Ok(H2Pick::H1 {
+                tls: Box::new(tls),
+                info,
+            });
+        }
+        match self.h2_handshake(tls).await {
+            Ok(sender) => {
+                slot.upstream = H2Upstream::Open {
+                    sender: sender.clone(),
+                    info: info.clone(),
+                };
+                Ok(H2Pick::H2 {
+                    sender,
+                    info,
+                    generation: slot.generation,
+                })
+            }
+            Err(e) => {
+                self.logger.error(format!(
+                    "MITM upstream {target} HTTP/2 handshake failed: {e}"
+                ));
+                slot.upstream = H2Upstream::Closed;
+                Err(DialFailure {
+                    status: StatusCode::BAD_GATEWAY,
+                    info,
+                })
             }
         }
     }
 
-    async fn forward_h2(
-        &self,
-        req: Request<Incoming>,
-        mut sender: client_http2::SendRequest<ProxyBody>,
-        info: &RouteInfo,
-    ) -> Response<ProxyBody> {
+    /// Retire the connection of `generation`, unless a redial already replaced it.
+    async fn h2_retire(tunnel: &H2Tunnel, generation: u64) {
+        let mut slot = tunnel.slot.lock().await;
+        if slot.generation == generation && matches!(slot.upstream, H2Upstream::Open { .. }) {
+            slot.upstream = H2Upstream::Closed;
+        }
+    }
+
+    async fn forward_h2(&self, req: Request<Incoming>, tunnel: &H2Tunnel) -> Response<ProxyBody> {
         let (authority, url) = self.request_target(&req);
         let mut guard = self.guard(req.method().as_str(), url.clone());
-        set_route(&mut guard, info);
         let (mut parts, body) = req.into_parts();
+        // `te: trailers` is the one TE value HTTP/2 allows, and gRPC needs it end to end.
+        let te_trailers = accepts_trailers(&parts.headers);
         strip_hop_by_hop(&mut parts.headers);
         parts.headers.remove(header::HOST);
         parts.version = Version::HTTP_2;
@@ -1118,30 +1276,217 @@ impl Session {
                 );
             }
         };
-        let body = CountingBody::new(body, guard.bytes_in(), None).boxed();
-        let resp = match sender.send_request(Request::from_parts(parts, body)).await {
-            Ok(r) => r,
+        if te_trailers {
+            parts
+                .headers
+                .insert(header::TE, HeaderValue::from_static("trailers"));
+        }
+        // A body-less idempotent request may be resent when the origin dropped its
+        // connection before answering, as browsers do.
+        let replay = (body.is_end_stream() && parts.method.is_idempotent()).then(|| parts.clone());
+        let mut request = Request::from_parts(
+            parts,
+            CountingBody::new(body, guard.bytes_in(), None).boxed(),
+        );
+        let mut resent = false;
+        loop {
+            let (mut sender, info, generation) = match self.h2_pick(tunnel).await {
+                Ok(H2Pick::H2 {
+                    sender,
+                    info,
+                    generation,
+                }) => (sender, info, generation),
+                Ok(H2Pick::H1 { tls, info }) => {
+                    set_route(&mut guard, &info);
+                    return self
+                        .forward_h2_over_h1(request, *tls, guard, &authority)
+                        .await;
+                }
+                Err(f) => {
+                    set_route(&mut guard, &f.info);
+                    guard.set_status(f.status);
+                    let msg = if f.status == StatusCode::FORBIDDEN {
+                        "destination blocked"
+                    } else {
+                        "upstream connection failed"
+                    };
+                    return self.error(f.status, msg, &authority);
+                }
+            };
+            let err = match sender.try_send_request(request).await {
+                Ok(resp) => {
+                    set_route(&mut guard, &info);
+                    return relay_response(resp, guard);
+                }
+                Err(e) => e,
+            };
+            // Unsent: the connection closed before the request was written, so any request
+            // may go out again. Dropped: written, but the connection went away unanswered.
+            let mut err = err;
+            let unsent = err.take_message();
+            let dropped = upstream_dropped(err.error());
+            if unsent.is_some() || dropped {
+                Self::h2_retire(tunnel, generation).await;
+            }
+            let again = unsent.or_else(|| {
+                replay
+                    .clone()
+                    .filter(|_| dropped)
+                    .map(|p| Request::from_parts(p, empty_body()))
+            });
+            match again {
+                Some(r) if !resent => {
+                    self.logger.debug(format!(
+                        "MITM upstream HTTP/2 connection to {authority} closed before \
+                         answering; resending on a new connection"
+                    ));
+                    resent = true;
+                    request = r;
+                }
+                _ => {
+                    set_route(&mut guard, &info);
+                    self.logger.error(format!(
+                        "MITM upstream HTTP/2 request to {authority} failed: {}",
+                        error_chain(err.error())
+                    ));
+                    guard.set_status(StatusCode::BAD_GATEWAY);
+                    return self.error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream request failed",
+                        &authority,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Send one decrypted HTTP/2 request over a dedicated HTTP/1.1 upstream connection
+    /// (the origin stopped negotiating `h2` mid-tunnel).
+    async fn forward_h2_over_h1(
+        &self,
+        request: Request<ProxyBody>,
+        tls: UpstreamTls,
+        mut guard: AccessGuard,
+        authority: &str,
+    ) -> Response<ProxyBody> {
+        let (mut parts, body) = request.into_parts();
+        strip_hop_by_hop(&mut parts.headers);
+        let origin = parts.uri.path_and_query().map_or("/", |pq| pq.as_str());
+        parts.uri = origin
+            .parse::<Uri>()
+            .unwrap_or_else(|_| Uri::from_static("/"));
+        parts.version = Version::HTTP_11;
+        match HeaderValue::from_str(authority) {
+            Ok(v) => {
+                parts.headers.insert(header::HOST, v);
+            }
+            Err(_) => {
+                guard.set_status(StatusCode::BAD_REQUEST);
+                return self.error(StatusCode::BAD_REQUEST, "invalid host", authority);
+            }
+        }
+        let sent = match self.h1_handshake(tls).await {
+            Ok(mut sender) => sender.send_request(Request::from_parts(parts, body)).await,
+            Err(e) => Err(e),
+        };
+        match sent {
+            Ok(resp) => {
+                let mut resp = relay_response(resp, guard);
+                *resp.version_mut() = Version::HTTP_2;
+                resp
+            }
             Err(e) => {
                 self.logger.error(format!(
-                    "MITM upstream HTTP/2 request to {authority} failed: {e}"
+                    "MITM upstream HTTP/1.1 request to {authority} failed: {}",
+                    error_chain(&e)
                 ));
                 guard.set_status(StatusCode::BAD_GATEWAY);
-                return self.error(
+                self.error(
                     StatusCode::BAD_GATEWAY,
                     "upstream request failed",
-                    &authority,
-                );
+                    authority,
+                )
             }
-        };
-        guard.set_status(resp.status());
-        let (mut parts, body) = resp.into_parts();
-        strip_hop_by_hop(&mut parts.headers);
-        let bytes_out = guard.bytes_out();
-        Response::from_parts(
-            parts,
-            CountingBody::new(body, bytes_out, Some(guard)).boxed(),
-        )
+        }
     }
+}
+
+/// Hand an upstream response to the client: hop-by-hop headers stripped, body counted, and
+/// the access record completed when the body ends.
+fn relay_response(resp: Response<Incoming>, mut guard: AccessGuard) -> Response<ProxyBody> {
+    guard.set_status(resp.status());
+    let (mut parts, body) = resp.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+    let bytes_out = guard.bytes_out();
+    Response::from_parts(
+        parts,
+        CountingBody::new(body, bytes_out, Some(guard)).boxed(),
+    )
+}
+
+/// `e` and each of its sources, joined with `: ` (hyper's own message is only the error
+/// kind, such as `http2 error`; the cause, such as an HTTP/2 reset reason, is a source).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut source = e.source();
+    while let Some(err) = source {
+        let msg = err.to_string();
+        if !out.ends_with(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        source = err.source();
+    }
+    out
+}
+
+/// Whether the client's `TE` header lists `trailers`.
+fn accepts_trailers(headers: &header::HeaderMap) -> bool {
+    headers
+        .get_all(header::TE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|t| t.split(';').next())
+        .any(|t| t.trim().eq_ignore_ascii_case("trailers"))
+}
+
+/// Whether an upstream HTTP/2 request failed because the connection went away before an
+/// answer: the origin refused the stream, sent GOAWAY, or the connection closed or reset.
+/// The origin may still have started on such a request, so only body-less idempotent
+/// requests are resent on this signal.
+fn upstream_dropped(e: &hyper::Error) -> bool {
+    if e.is_canceled() || e.is_closed() || e.is_incomplete_message() {
+        return true;
+    }
+    let mut source = std::error::Error::source(e);
+    while let Some(err) = source {
+        if let Some(h2e) = err.downcast_ref::<h2::Error>() {
+            if h2e.is_remote()
+                && (h2e.is_go_away() || h2e.reason() == Some(h2::Reason::REFUSED_STREAM))
+            {
+                return true;
+            }
+            if h2e.is_io() {
+                source = h2e
+                    .get_io()
+                    .map(|io| io as &(dyn std::error::Error + 'static));
+                continue;
+            }
+            return false;
+        }
+        if let Some(io) = err.downcast_ref::<io::Error>() {
+            return matches!(
+                io.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::UnexpectedEof
+            );
+        }
+        source = err.source();
+    }
+    false
 }
 
 fn empty_body() -> ProxyBody {

@@ -1,6 +1,6 @@
 [package]
 name = "rusty-conduit-engine"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Shared proxy and routing engine for the rusty-conduit CLI family (pure-Rust TLS/crypto)"
 license = "BSD-3-Clause"
@@ -24,6 +24,9 @@ hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http = "1"
 http-body-util = "0.1"
+# Already in the graph through hyper; read directly only to classify upstream HTTP/2
+# stream errors (GOAWAY / REFUSED_STREAM) when deciding whether a request may be resent.
+h2 = "0.4"
 
 # TLS & certificates (pure-Rust stack; `ring` provider, no OpenSSL / aws-lc)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

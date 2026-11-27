@@ -222,7 +222,7 @@ When the owning doc lies inside a nested root, make the update there — but say
 - **Pure-Rust crypto.** TLS and certificates use `rustls` with the `ring` provider, plus `rcgen`, `x509-parser`, and `p12-keystore`. `openssl-sys` and `aws-lc-sys` must never enter the normal dependency graph on any target. `scripts/check-pure-rust-crypto.py` enforces this.
 - **Releases.** Tag `vX.Y.Z` with an annotated tag whose message body is the release notes (`git tag -a vX.Y.Z -F notes.md`). Pushing the tag runs `.github/workflows/release.yml`, which re-runs verification and creates the GitHub Release from that body. Follow the workspace's engine release order when one applies.
 - **`routing` cargo feature (default on).** It gates `regex`. Every module must still build and pass tests with `--no-default-features`. Regex-based conditions then fail to compile with an error that names the `routing` feature.
-- **No hidden caches.** Every dial resolves DNS afresh: no DNS cache, no connection pooling. The MITM leaf-certificate cache (`src/mitm/cache.rs`) is the only cache in the engine.
+- **No hidden caches.** Every dial resolves DNS afresh: no DNS cache, no connection pooling (a MITM tunnel holds one upstream connection at a time and redials it when it closes). The MITM leaf-certificate cache (`src/mitm/cache.rs`) is the only cache in the engine.
 - **Credentials stay secret.** Credentials, private keys, and passphrases never appear in `Debug` output, logs, or error strings. The `upstream` field of access records is always redacted.
 - **Divergence ledger.** Any behavior that differs from a consumer's former copy, or any change to behavior a consumer relied on, gets an entry in `docs/DIVERGENCE-LEDGER.md` with a decision (`keep`, `option`, or `fix`). Never drop a difference silently.
 - **Verification.** Before finishing a code change, run the CI checks from `.github/workflows/ci.yml`:
@@ -246,7 +246,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Single-port protocol sniffing** — classifies a connection as HTTP, SOCKS4, or SOCKS5 by peeking its first byte. Start: `src/mux.rs`.
 - **HTTP/HTTPS proxy engine** — HTTP forward proxy, opaque `CONNECT` tunnel, the MITM interception path, and HTML error pages for proxy-generated errors. Start: `src/http/mod.rs`. Detail in ./src/http.
 - **SOCKS4/4a/5 proxy engine** — TCP `CONNECT` server with the relay-guard hook and SOCKS web blocking. Start: `src/socks/mod.rs`. Detail in ./src/socks.
-- **HTTPS MITM** — user-supplied CA loading, per-host leaf signing and caching, TLS interception of `CONNECT`. Start: `src/mitm/mod.rs`. Files: `src/http/mitm_tunnel.rs`, `tests/mitm_counters.rs`. Detail in ./src/mitm and ./src/http.
+- **HTTPS MITM** — user-supplied CA loading, per-host leaf signing and caching, TLS interception of `CONNECT`. Start: `src/mitm/mod.rs`. Files: `src/http/mitm_tunnel.rs`, `tests/mitm_counters.rs`, `tests/mitm_h2_upstream_reconnect.rs`. Detail in ./src/mitm and ./src/http.
 - **Routing model and hot-reload snapshots** — serde routing/profile types, `RoutingInput`, compiled immutable `RoutingState`, and the lock-free `SharedRouting` (`arc-swap`) handle the engines read from. Start: `src/routing.rs`. Files: `src/router/`, `src/upstream/`.
 - **Rule matching and validation** — the Auto Switch `Router`, rule conditions, and configuration validation. Start: `src/router/mod.rs`. Detail in ./src/router.
 - **Upstream dialers and failover** — `direct`, `block`, `http`/`https`, `socks5`, `socks4a`, external dialers, `FailoverDialer`, `ProfileRegistry`. Start: `src/upstream/mod.rs`. Detail in ./src/upstream.
@@ -260,7 +260,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Pure-Rust crypto policy check** — fails if `openssl-sys` or `aws-lc-sys` is in the dependency graph. Start: `scripts/check-pure-rust-crypto.py`. Files: `Cargo.toml`, `Cargo.lock`.
 - **Continuous integration** — format, clippy, no-default-features, crypto policy, and the test matrix on Linux, macOS, and Windows. Start: `.github/workflows/ci.yml`.
 - **Release** — on a `v*` tag, re-runs verification and creates the GitHub Release from the annotated tag's message body. Start: `.github/workflows/release.yml`.
-- **Integration tests** — end-to-end tests of counters, the custom resolver, MITM, and proxy error pages. Start: `tests/traffic_counters.rs`. Files: `tests/route_resolver.rs`, `tests/mitm_counters.rs`, `tests/error_pages.rs`.
+- **Integration tests** — end-to-end tests of counters, the custom resolver, MITM (including HTTP/2 upstream reconnects), and proxy error pages. Start: `tests/traffic_counters.rs`. Files: `tests/route_resolver.rs`, `tests/mitm_counters.rs`, `tests/mitm_h2_upstream_reconnect.rs`, `tests/error_pages.rs`.
 - **Divergence ledger and open items** — recorded differences from each consumer's former copy and engine changes every consumer inherits, plus open decisions. Start: `docs/DIVERGENCE-LEDGER.md`. Files: `docs/TODO.md`.
 
 ## Child DOX Index

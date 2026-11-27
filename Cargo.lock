@@ -1189,12 +1189,13 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rusty-conduit-engine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
  "bytes",
  "dashmap",
+ "h2",
  "http",
  "http-body-util",
  "humantime",
