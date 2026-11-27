@@ -15,7 +15,8 @@ use std::time::Duration;
 use rustls::crypto::CryptoProvider;
 use time::OffsetDateTime;
 
-use crate::http::mitm_tunnel::{platform_client_config, MitmInterceptor};
+use crate::filter::FilterRule;
+use crate::http::mitm_tunnel::{upstream_client_config, MitmInterceptor};
 use ca::{CaError, CaMaterial};
 use cache::CertCache;
 use signer::{LeafSigner, SignError};
@@ -42,6 +43,19 @@ pub enum CaSource {
     Pkcs12 { path: PathBuf },
 }
 
+/// How HTTPS MITM verifies upstream server certificates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum UpstreamTlsVerification {
+    /// Verify every upstream server certificate with the OS trust store (default).
+    #[default]
+    Strict,
+    /// Accept invalid/self-signed upstream certificates only for targets matching any rule
+    /// (exact domain, `*.domain`, IP, or CIDR via `FilterRule`); verify all other targets strictly.
+    AllowInsecureHosts(Vec<FilterRule>),
+    /// Accept invalid/self-signed upstream certificates for ALL targets ("blind trust", unsafe).
+    InsecureAll,
+}
+
 /// MITM settings, independent of how a CLI loads its configuration.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MitmOptions {
@@ -55,6 +69,8 @@ pub struct MitmOptions {
     pub cert_ttl: Duration,
     /// Maximum cached leaf certificates (`0` = unlimited).
     pub cert_cache_max: usize,
+    /// How upstream server certificates are verified (default: strict).
+    pub upstream_tls: UpstreamTlsVerification,
 }
 
 impl Default for MitmOptions {
@@ -65,6 +81,7 @@ impl Default for MitmOptions {
             passphrase_file: None,
             cert_ttl: DEFAULT_MITM_CERT_TTL,
             cert_cache_max: DEFAULT_MITM_CERT_CACHE_MAX,
+            upstream_tls: UpstreamTlsVerification::Strict,
         }
     }
 }
@@ -80,6 +97,7 @@ impl fmt::Debug for MitmOptions {
             .field("passphrase_file", &self.passphrase_file)
             .field("cert_ttl", &self.cert_ttl)
             .field("cert_cache_max", &self.cert_cache_max)
+            .field("upstream_tls", &self.upstream_tls)
             .finish()
     }
 }
@@ -141,14 +159,14 @@ pub struct MitmState {
 
 impl MitmState {
     /// Load and validate the configured CA and build the signer, cache, and interceptor
-    /// (upstream TLS verified with the platform verifier). Returns `Ok(None)` when MITM is
+    /// (upstream TLS verified as `cfg.upstream_tls` says). Returns `Ok(None)` when MITM is
     /// OFF (no CA configured).
     pub fn from_options(cfg: &MitmOptions) -> Result<Option<Self>, MitmError> {
         let Some(source) = cfg.ca.clone() else {
             return Ok(None);
         };
         let provider = crypto_provider();
-        let upstream = platform_client_config(Arc::clone(&provider))?;
+        let upstream = upstream_client_config(Arc::clone(&provider), &cfg.upstream_tls)?;
         Self::build(cfg, &source, provider, upstream).map(Some)
     }
 
@@ -169,14 +187,14 @@ impl MitmState {
     /// CA certificate (optionally followed by intermediates) and `key_pem` its private key;
     /// an encrypted key is decrypted with `opts.passphrase` (or `opts.passphrase_file`).
     /// `opts.ca` is ignored; `opts.cert_ttl` and `opts.cert_cache_max` apply as usual.
-    /// Upstream TLS is verified with the platform verifier.
+    /// Upstream TLS is verified as `opts.upstream_tls` says.
     pub fn from_pem_bytes(
         cert_chain_pem: &[u8],
         key_pem: &[u8],
         opts: &MitmOptions,
     ) -> Result<Self, MitmError> {
         let provider = crypto_provider();
-        let upstream = platform_client_config(Arc::clone(&provider))?;
+        let upstream = upstream_client_config(Arc::clone(&provider), &opts.upstream_tls)?;
         Self::from_pem_bytes_with_upstream(cert_chain_pem, key_pem, opts, provider, upstream)
     }
 
@@ -338,5 +356,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, MitmError::Ca(CaError::Expired(_))), "{err}");
+    }
+
+    #[test]
+    fn upstream_tls_defaults_to_strict_and_every_mode_builds() {
+        let opts = MitmOptions::default();
+        assert_eq!(opts.upstream_tls, UpstreamTlsVerification::Strict);
+        assert!(format!("{opts:?}").contains("upstream_tls: Strict"));
+
+        let ca = test_ca();
+        for upstream_tls in [
+            UpstreamTlsVerification::Strict,
+            UpstreamTlsVerification::AllowInsecureHosts(vec![]),
+            UpstreamTlsVerification::AllowInsecureHosts(vec![
+                "*.lab.test".parse().unwrap(),
+                "10.0.0.0/8".parse().unwrap(),
+            ]),
+            UpstreamTlsVerification::InsecureAll,
+        ] {
+            let opts = MitmOptions {
+                upstream_tls: upstream_tls.clone(),
+                ..MitmOptions::default()
+            };
+            MitmState::from_pem_bytes(ca.cert_pem.as_bytes(), ca.key_pem.as_bytes(), &opts)
+                .unwrap_or_else(|e| panic!("{upstream_tls:?}: {e}"));
+        }
     }
 }

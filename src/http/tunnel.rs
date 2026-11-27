@@ -21,8 +21,7 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{
-    connect_established, dial_error_status, error_response, failed_route, ConnectTarget, ProxyBody,
-    RequestCtx,
+    connect_established, dial_error_status, failed_route, ConnectTarget, ProxyBody, RequestCtx,
 };
 use crate::net::relay_bidirectional;
 use crate::router::RouteRequest;
@@ -44,9 +43,15 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
             "rejected CONNECT from {}: invalid target {authority:?}",
             ctx.peer
         ));
-        return error_response(StatusCode::BAD_REQUEST, "CONNECT target must be host:port");
+        return ctx.error(
+            StatusCode::BAD_REQUEST,
+            "CONNECT target must be host:port",
+            None,
+        );
     };
 
+    let page = target.authority();
+    let page = Some(page.as_str());
     let state = Arc::clone(&ctx.state);
     let route_req = RouteRequest {
         inbound: Inbound::Http,
@@ -63,7 +68,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
                 "CONNECT {target} from {} denied by filter: {denied}",
                 ctx.peer
             ));
-            return error_response(StatusCode::FORBIDDEN, "destination not allowed");
+            return ctx.error(StatusCode::FORBIDDEN, "destination not allowed", page);
         }
     };
     let rule = decision.rule_label().to_string();
@@ -79,7 +84,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
             guard.set_route(&rule, profile, upstream);
             guard.set_status(StatusCode::BAD_GATEWAY);
             logger.error(format!("CONNECT {target}: {e}"));
-            return error_response(StatusCode::BAD_GATEWAY, "upstream not configured");
+            return ctx.error(StatusCode::BAD_GATEWAY, "upstream not configured", page);
         }
     };
 
@@ -108,7 +113,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
             );
             guard.set_route(&rule, profile, upstream);
             guard.set_status(status);
-            return error_response(status, "upstream connection failed");
+            return ctx.error(status, "upstream connection failed", page);
         }
     };
     let profile = decision

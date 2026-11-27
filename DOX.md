@@ -244,7 +244,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Crate entry and module layout** — public module tree and crate docs. Start: `src/lib.rs`. Files: `Cargo.toml`.
 - **Listeners and graceful shutdown** — separate or single-port listeners, connection dispatch, connection limits, a 4096 listen backlog (`LISTEN_BACKLOG`, capped by the kernel's somaxconn), drain-on-shutdown (`Server`, `EngineHandlers`, `ShutdownReport`). Start: `src/server.rs`. Files: `src/mux.rs`.
 - **Single-port protocol sniffing** — classifies a connection as HTTP, SOCKS4, or SOCKS5 by peeking its first byte. Start: `src/mux.rs`.
-- **HTTP/HTTPS proxy engine** — HTTP forward proxy, opaque `CONNECT` tunnel, and the MITM interception path. Start: `src/http/mod.rs`. Detail in ./src/http.
+- **HTTP/HTTPS proxy engine** — HTTP forward proxy, opaque `CONNECT` tunnel, the MITM interception path, and HTML error pages for proxy-generated errors. Start: `src/http/mod.rs`. Detail in ./src/http.
 - **SOCKS4/4a/5 proxy engine** — TCP `CONNECT` server with the relay-guard hook and SOCKS web blocking. Start: `src/socks/mod.rs`. Detail in ./src/socks.
 - **HTTPS MITM** — user-supplied CA loading, per-host leaf signing and caching, TLS interception of `CONNECT`. Start: `src/mitm/mod.rs`. Files: `src/http/mitm_tunnel.rs`, `tests/mitm_counters.rs`. Detail in ./src/mitm and ./src/http.
 - **Routing model and hot-reload snapshots** — serde routing/profile types, `RoutingInput`, compiled immutable `RoutingState`, and the lock-free `SharedRouting` (`arc-swap`) handle the engines read from. Start: `src/routing.rs`. Files: `src/router/`, `src/upstream/`.
@@ -260,7 +260,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **Pure-Rust crypto policy check** — fails if `openssl-sys` or `aws-lc-sys` is in the dependency graph. Start: `scripts/check-pure-rust-crypto.py`. Files: `Cargo.toml`, `Cargo.lock`.
 - **Continuous integration** — format, clippy, no-default-features, crypto policy, and the test matrix on Linux, macOS, and Windows. Start: `.github/workflows/ci.yml`.
 - **Release** — on a `v*` tag, re-runs verification and creates the GitHub Release from the annotated tag's message body. Start: `.github/workflows/release.yml`.
-- **Integration tests** — end-to-end tests of counters, the custom resolver, and MITM. Start: `tests/traffic_counters.rs`. Files: `tests/route_resolver.rs`, `tests/mitm_counters.rs`.
+- **Integration tests** — end-to-end tests of counters, the custom resolver, MITM, and proxy error pages. Start: `tests/traffic_counters.rs`. Files: `tests/route_resolver.rs`, `tests/mitm_counters.rs`, `tests/error_pages.rs`.
 - **Divergence ledger and open items** — recorded differences from each consumer's former copy and engine changes every consumer inherits, plus open decisions. Start: `docs/DIVERGENCE-LEDGER.md`. Files: `docs/TODO.md`.
 
 ## Child DOX Index

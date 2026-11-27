@@ -9,8 +9,9 @@
 //!    [`Router`](crate::router::Router) decision → failover chain from the
 //!    [`ProfileRegistry`](crate::upstream::ProfileRegistry) → an
 //!    [`UpstreamStream`] (`direct`, `socks5`, `socks4a`, `http` / `https` `CONNECT`). Upstream
-//!    TLS (`tokio-rustls` client, SNI = leaf host, verified with the platform verifier or an
-//!    injected root store) then runs **over that stream**, so TLS-over-TLS to an `https`
+//!    TLS (`tokio-rustls` client, SNI = leaf host, verified per
+//!    [`UpstreamTlsVerification`] — see [`upstream_client_config`] — or with an injected
+//!    config) then runs **over that stream**, so TLS-over-TLS to an `https`
 //!    proxy works the same way as a plain TCP tunnel.
 //! 3. The leaf certificate comes from the [`CertCache`] (signed on a miss) and the client
 //!    TLS handshake is completed.
@@ -52,11 +53,12 @@ use hyper::service::service_fn;
 use hyper::upgrade::Upgraded;
 use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use rustls::crypto::CryptoProvider;
-use rustls::pki_types::ServerName;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::{Acceptor, ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use rustls_platform_verifier::BuilderVerifierExt;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -64,13 +66,16 @@ use tokio_rustls::{client::TlsStream as ClientTlsStream, LazyConfigAcceptor, Tls
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use super::error_page::page_target;
 use super::forward::strip_hop_by_hop;
 use super::tunnel::CountingStream;
 use super::{
-    dial_error_status, error_response, AccessGuard, ConnectTarget, CountingBody, ProxyBody,
+    dial_error_status, AccessGuard, ConnectTarget, CountingBody, ErrorPageTemplate, ProxyBody,
 };
+use crate::filter::FilterRule;
 use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
 use crate::mitm::cache::CertCache;
+use crate::mitm::UpstreamTlsVerification;
 use crate::net::relay_bidirectional;
 use crate::router::{RouteDecision, RouteRequest};
 use crate::routing::Inbound;
@@ -110,6 +115,179 @@ pub fn client_config_with_roots(
         .with_no_client_auth())
 }
 
+/// Upstream TLS client config for a [`UpstreamTlsVerification`] mode.
+///
+/// * `Strict` — [`platform_client_config`].
+/// * `AllowInsecureHosts(rules)` — certificates of targets matching any rule (exact domain,
+///   `*.domain`, IP, or CIDR) are accepted unverified; every other target is verified with
+///   the platform verifier. An empty rule list is the same as `Strict`.
+/// * `InsecureAll` — every upstream certificate is accepted unverified.
+///
+/// Handshake signatures are always verified against the certificate presented, so an
+/// accepted certificate still has to belong to the peer completing the handshake.
+pub fn upstream_client_config(
+    provider: Arc<CryptoProvider>,
+    verification: &UpstreamTlsVerification,
+) -> Result<ClientConfig, rustls::Error> {
+    let verifier: Arc<dyn ServerCertVerifier> = match verification {
+        UpstreamTlsVerification::Strict => return platform_client_config(provider),
+        UpstreamTlsVerification::AllowInsecureHosts(rules) if rules.is_empty() => {
+            return platform_client_config(provider)
+        }
+        UpstreamTlsVerification::AllowInsecureHosts(rules) => {
+            Arc::new(SelectiveServerCertVerifier {
+                platform: Arc::new(rustls_platform_verifier::Verifier::new(Arc::clone(
+                    &provider,
+                ))?),
+                rules: rules.clone(),
+                provider: Arc::clone(&provider),
+            })
+        }
+        UpstreamTlsVerification::InsecureAll => {
+            Arc::new(InsecureServerCertVerifier(Arc::clone(&provider)))
+        }
+    };
+    Ok(ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth())
+}
+
+fn verify_tls12(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    verify_tls12_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
+}
+
+fn verify_tls13(
+    provider: &CryptoProvider,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
+    verify_tls13_signature(
+        message,
+        cert,
+        dss,
+        &provider.signature_verification_algorithms,
+    )
+}
+
+/// `UpstreamTlsVerification::InsecureAll`: accepts any server certificate but still checks
+/// handshake signatures.
+#[derive(Debug)]
+struct InsecureServerCertVerifier(Arc<CryptoProvider>);
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12(&self.0, message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13(&self.0, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// `UpstreamTlsVerification::AllowInsecureHosts`: skips certificate verification for
+/// targets matching a rule and delegates every other target to the platform verifier.
+#[derive(Debug)]
+struct SelectiveServerCertVerifier {
+    platform: Arc<rustls_platform_verifier::Verifier>,
+    rules: Vec<FilterRule>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl SelectiveServerCertVerifier {
+    fn is_insecure_target(&self, server_name: &ServerName<'_>) -> bool {
+        match server_name {
+            ServerName::DnsName(name) => {
+                let domain = name.as_ref().trim_end_matches('.').to_ascii_lowercase();
+                self.rules.iter().any(|r| r.matches_domain(&domain))
+            }
+            ServerName::IpAddress(ip) => {
+                let ip = std::net::IpAddr::from(*ip);
+                self.rules.iter().any(|r| r.matches_ip(ip))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ServerCertVerifier for SelectiveServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if self.is_insecure_target(server_name) {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.platform
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12(&self.provider, message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13(&self.provider, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// An intercepted `CONNECT`, handed to [`MitmInterceptor::intercept`] after the client
 /// received `200 Connection Established`.
 pub(crate) struct MitmConnect {
@@ -129,6 +307,8 @@ pub(crate) struct MitmConnect {
     /// The live resolver: with URL rules every decrypted request pins a fresh view of it
     /// (hot-reload).
     pub(crate) live: Arc<dyn RouteResolver>,
+    /// The HTTP engine's error page; [`MitmInterceptor::with_error_page`] overrides it.
+    pub(crate) error_page: ErrorPageTemplate,
 }
 
 /// The MITM `CONNECT` handler. Cheap to clone.
@@ -137,12 +317,14 @@ pub struct MitmInterceptor {
     cache: Arc<CertCache>,
     upstream_tls: Arc<ClientConfig>,
     provider: Arc<CryptoProvider>,
+    error_page: Option<ErrorPageTemplate>,
 }
 
 impl fmt::Debug for MitmInterceptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MitmInterceptor")
             .field("cache", &self.cache)
+            .field("error_page", &self.error_page)
             .finish_non_exhaustive()
     }
 }
@@ -351,6 +533,8 @@ struct Session {
     default_authority: String,
     dialer: Dialer,
     routing: Routing,
+    /// Template for errors the proxy answers decrypted requests with.
+    error_page: ErrorPageTemplate,
 }
 
 impl MitmInterceptor {
@@ -363,7 +547,16 @@ impl MitmInterceptor {
             cache,
             upstream_tls,
             provider,
+            error_page: None,
         }
+    }
+
+    /// Render errors for decrypted requests with `template`, overriding the HTTP engine's
+    /// [`HttpProxy::with_error_page`](super::HttpProxy::with_error_page). Upstream
+    /// responses are never rewritten.
+    pub fn with_error_page(mut self, template: ErrorPageTemplate) -> Self {
+        self.error_page = Some(template);
+        self
     }
 
     pub fn cache(&self) -> &Arc<CertCache> {
@@ -381,7 +574,9 @@ impl MitmInterceptor {
             state,
             route,
             live,
+            error_page,
         } = connect;
+        let error_page = self.error_page.clone().unwrap_or(error_page);
         let tasks = TaskTracker::new();
         let connect_guard = |status: StatusCode, info: &RouteInfo| {
             let mut g = new_guard(&access, &tasks, client, "CONNECT", target.authority());
@@ -527,6 +722,7 @@ impl MitmInterceptor {
             default_authority,
             dialer,
             routing,
+            error_page,
         };
 
         // 4. Serve decrypted HTTP.
@@ -602,6 +798,12 @@ fn set_route(guard: &mut AccessGuard, info: &RouteInfo) {
 impl Session {
     fn guard(&self, method: &str, target: String) -> AccessGuard {
         new_guard(&self.access, &self.tasks, self.client, method, target)
+    }
+
+    /// A proxy-generated error page for the request's `authority`.
+    fn error(&self, status: StatusCode, msg: &str, authority: &str) -> Response<ProxyBody> {
+        self.error_page
+            .response(status, msg, page_target(authority))
     }
 
     /// `(authority, https:// URL)` for a decrypted request.
@@ -743,7 +945,7 @@ impl Session {
             Ok(d) => d,
             Err(f) => {
                 guard.set_status(f.status);
-                return error_response(f.status, "destination not allowed");
+                return self.error(f.status, "destination not allowed", &authority);
             }
         };
         let upgrade = is_upgrade_request(&req).then(|| {
@@ -771,7 +973,7 @@ impl Session {
                 }
                 Err(_) => {
                     guard.set_status(StatusCode::BAD_REQUEST);
-                    return error_response(StatusCode::BAD_REQUEST, "invalid host");
+                    return self.error(StatusCode::BAD_REQUEST, "invalid host", &authority);
                 }
             }
         }
@@ -786,7 +988,7 @@ impl Session {
                 } else {
                     "upstream connection failed"
                 };
-                return error_response(f.status, msg);
+                return self.error(f.status, msg, &authority);
             }
         };
         set_route(&mut guard, &up.info);
@@ -798,7 +1000,11 @@ impl Session {
                 self.logger
                     .error(format!("MITM upstream request to {authority} failed: {e}"));
                 guard.set_status(StatusCode::BAD_GATEWAY);
-                return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+                return self.error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream request failed",
+                    &authority,
+                );
             }
         };
         guard.set_status(resp.status());
@@ -905,7 +1111,11 @@ impl Session {
             Ok(u) => u,
             Err(_) => {
                 guard.set_status(StatusCode::BAD_REQUEST);
-                return error_response(StatusCode::BAD_REQUEST, "invalid request target");
+                return self.error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request target",
+                    &authority,
+                );
             }
         };
         let body = CountingBody::new(body, guard.bytes_in(), None).boxed();
@@ -916,7 +1126,11 @@ impl Session {
                     "MITM upstream HTTP/2 request to {authority} failed: {e}"
                 ));
                 guard.set_status(StatusCode::BAD_GATEWAY);
-                return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+                return self.error(
+                    StatusCode::BAD_GATEWAY,
+                    "upstream request failed",
+                    &authority,
+                );
             }
         };
         guard.set_status(resp.status());
@@ -969,5 +1183,141 @@ mod tests {
     fn authority_host_brackets_ipv6() {
         assert_eq!(authority_host("::1"), "[::1]");
         assert_eq!(authority_host("example.com"), "example.com");
+    }
+
+    /// Serve a fresh self-signed certificate (SAN `san`) over an in-memory pipe and run a
+    /// client handshake with `verification` against `server_name`.
+    async fn handshake(
+        verification: &UpstreamTlsVerification,
+        san: &str,
+        server_name: &str,
+    ) -> Result<(), io::Error> {
+        let provider = crate::mitm::crypto_provider();
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec![san.to_string()]).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(signing_key.serialize_der().into());
+        let server_cfg = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.der().clone()], key)
+            .unwrap();
+        let client_cfg = upstream_client_config(provider, verification).unwrap();
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+        let server = tokio::spawn(async move { acceptor.accept(server_io).await.map(|_| ()) });
+        let name = ServerName::try_from(server_name.to_string()).unwrap();
+        let res = TlsConnector::from(Arc::new(client_cfg))
+            .connect(name, client_io)
+            .await
+            .map(|_| ());
+        let _ = server.await;
+        res
+    }
+
+    fn rules(list: &[&str]) -> UpstreamTlsVerification {
+        UpstreamTlsVerification::AllowInsecureHosts(
+            list.iter()
+                .map(|r| r.parse::<FilterRule>().unwrap())
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn strict_rejects_self_signed_upstream() {
+        let strict = UpstreamTlsVerification::Strict;
+        assert!(handshake(&strict, "self-signed.test", "self-signed.test")
+            .await
+            .is_err());
+        assert!(handshake(&strict, "10.1.2.3", "10.1.2.3").await.is_err());
+        // An empty allowlist is strict.
+        assert!(
+            handshake(&rules(&[]), "self-signed.test", "self-signed.test")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn allowlist_accepts_only_matching_targets() {
+        let allow = rules(&["exact.test", "*.wild.test", "10.1.2.3", "192.168.50.0/24"]);
+        for host in ["exact.test", "EXACT.test", "a.wild.test", "a.b.wild.test"] {
+            handshake(&allow, host, host)
+                .await
+                .unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        for ip in ["10.1.2.3", "192.168.50.7"] {
+            handshake(&allow, ip, ip)
+                .await
+                .unwrap_or_else(|e| panic!("{ip}: {e}"));
+        }
+        for host in [
+            "other.test",
+            "wild.test",
+            "notexact.test",
+            "10.1.2.4",
+            "192.168.51.1",
+        ] {
+            assert!(
+                handshake(&allow, host, host).await.is_err(),
+                "{host} must be verified strictly"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn insecure_all_accepts_any_self_signed_upstream() {
+        let all = UpstreamTlsVerification::InsecureAll;
+        for host in ["self-signed.test", "anything.example", "10.9.8.7", "::1"] {
+            handshake(&all, host, host)
+                .await
+                .unwrap_or_else(|e| panic!("{host}: {e}"));
+        }
+        // The certificate need not even name the target.
+        handshake(&all, "unrelated.test", "target.test")
+            .await
+            .unwrap();
+    }
+
+    /// Server resolver presenting one certificate but signing with an unrelated key.
+    #[derive(Debug)]
+    struct MismatchedKey(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for MismatchedKey {
+        fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn insecure_modes_still_verify_handshake_signatures() {
+        let provider = crate::mitm::crypto_provider();
+        let presented = rcgen::generate_simple_self_signed(vec!["sig.test".to_string()]).unwrap();
+        let other = rcgen::KeyPair::generate().unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(other.serialize_der().into());
+        let signing_key = provider.key_provider.load_private_key(key).unwrap();
+        let certified = CertifiedKey::new(vec![presented.cert.der().clone()], signing_key);
+        let server_cfg = Arc::new(
+            ServerConfig::builder_with_provider(Arc::clone(&provider))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(MismatchedKey(Arc::new(certified)))),
+        );
+        for verification in [UpstreamTlsVerification::InsecureAll, rules(&["sig.test"])] {
+            let client_cfg = upstream_client_config(Arc::clone(&provider), &verification).unwrap();
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&server_cfg));
+            let server = tokio::spawn(async move { acceptor.accept(server_io).await.map(|_| ()) });
+            let res = TlsConnector::from(Arc::new(client_cfg))
+                .connect(ServerName::try_from("sig.test").unwrap(), client_io)
+                .await;
+            let _ = server.await;
+            assert!(
+                res.is_err(),
+                "{verification:?} accepted a bad handshake signature"
+            );
+        }
     }
 }

@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::http::mitm_tunnel::MitmInterceptor;
-use crate::http::HttpProxy;
+use crate::http::{ErrorPageTemplate, HttpProxy};
 use crate::logging::{AccessLogger, Logger};
 use crate::mux::{self, DetectedProtocol, DEFAULT_SNIFF_TIMEOUT};
 use crate::net::KeepaliveSettings;
@@ -169,6 +169,13 @@ impl EngineHandlers {
         if socks_block_web {
             self = self.with_socks_block_web();
         }
+        self
+    }
+
+    /// Render every proxy-generated HTTP error (forward, `CONNECT`, and decrypted MITM
+    /// requests) with `template`. Upstream responses are never rewritten.
+    pub fn with_error_page(mut self, template: ErrorPageTemplate) -> Self {
+        self.http = self.http.with_error_page(template);
         self
     }
 

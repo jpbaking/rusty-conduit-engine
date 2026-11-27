@@ -25,7 +25,8 @@ use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 
-use super::{dial_error_status, error_response, failed_route, CountingBody, ProxyBody, RequestCtx};
+use super::error_page::page_target;
+use super::{dial_error_status, failed_route, CountingBody, ProxyBody, RequestCtx};
 use crate::router::{ResolvedTarget, RouteRequest};
 use crate::routing::Inbound;
 use crate::server::RoutingState;
@@ -172,10 +173,12 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         Err(msg) => {
             guard.set_status(StatusCode::BAD_REQUEST);
             logger.debug(format!("rejected request from {}: {msg}", ctx.peer));
-            return error_response(StatusCode::BAD_REQUEST, msg);
+            let target = req.uri().authority().and_then(|a| page_target(a.as_str()));
+            return ctx.error(StatusCode::BAD_REQUEST, msg, target);
         }
     };
     let absolute = target.absolute();
+    let page = Some(target.host_header.as_str());
 
     let state = Arc::clone(&ctx.state);
     let route_req = RouteRequest {
@@ -193,7 +196,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
                 "request {absolute} from {} denied by filter: {denied}",
                 ctx.peer
             ));
-            return error_response(StatusCode::FORBIDDEN, "destination not allowed");
+            return ctx.error(StatusCode::FORBIDDEN, "destination not allowed", page);
         }
     };
     let rule = decision.rule_label().to_string();
@@ -209,7 +212,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
             guard.set_route(&rule, profile, upstream);
             guard.set_status(StatusCode::BAD_GATEWAY);
             logger.error(format!("request {absolute}: {e}"));
-            return error_response(StatusCode::BAD_GATEWAY, "upstream not configured");
+            return ctx.error(StatusCode::BAD_GATEWAY, "upstream not configured", page);
         }
     };
 
@@ -222,7 +225,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         }
         Err(_) => {
             guard.set_status(StatusCode::BAD_REQUEST);
-            return error_response(StatusCode::BAD_REQUEST, "invalid host");
+            return ctx.error(StatusCode::BAD_REQUEST, "invalid host", page);
         }
     }
 
@@ -251,7 +254,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
             );
             guard.set_route(&rule, profile, upstream);
             guard.set_status(status);
-            return error_response(status, "upstream connection failed");
+            return ctx.error(status, "upstream connection failed", page);
         }
     };
     let profile = decision
@@ -268,7 +271,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
                 Ok(u) => u,
                 Err(_) => {
                     guard.set_status(StatusCode::BAD_REQUEST);
-                    return error_response(StatusCode::BAD_REQUEST, "invalid request URI");
+                    return ctx.error(StatusCode::BAD_REQUEST, "invalid request URI", page);
                 }
             };
             if let Some(auth) = proxy
@@ -300,7 +303,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
                 logger.error(format!(
                     "upstream handshake for {absolute} via {upstream} failed: {e}"
                 ));
-                return error_response(StatusCode::BAD_GATEWAY, "upstream handshake failed");
+                return ctx.error(StatusCode::BAD_GATEWAY, "upstream handshake failed", page);
             }
         };
     let shutdown = ctx.shutdown.clone();
@@ -323,7 +326,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
             logger.error(format!(
                 "upstream request {absolute} via {upstream} failed: {e}"
             ));
-            return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
+            return ctx.error(StatusCode::BAD_GATEWAY, "upstream request failed", page);
         }
     };
     // One request per upstream connection: dropping the sender lets the driver finish.
