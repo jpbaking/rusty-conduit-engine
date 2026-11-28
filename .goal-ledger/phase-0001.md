@@ -1,62 +1,74 @@
-# phase-0001 — Serialize on routing config types
+# phase-0001 — Routing benchmark example and baseline
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Derive `Serialize` on every routing config type in `src/routing.rs`, omitting default-valued fields, so consumers can write the engine types back out instead of keeping their own copies.
-- Done when: every command in `## Verify` exits 0, including the new round-trip tests.
-- Pattern to follow: `../rusty-conduit-gui/crates/conduit-core/src/v2_model.rs:420-470` (the GUI's copy of `RoutingRule`, which already uses `#[serde(default, skip_serializing_if = "Option::is_none")]` on each optional field)
+- Goal: Add a dependency-free benchmark example that times `Router::route` over generated rule sets, and record the baseline numbers before any optimization.
+- Done when: `cargo run --release --example route_bench` prints the table described below and the numbers are recorded in this phase's `## Evidence`.
+- Pattern to follow: `src/router/mod.rs` tests `router(text)` helper (around line 582) for the idea only — it calls the crate-private `routing::test_support::input`, which an example cannot use; build `RoutingInput { profiles, routing, ..RoutingInput::default() }` yourself from a parsed TOML struct
 
 ## Context
-M-02: the GUI keeps a duplicate routing AST only because the engine types are `Deserialize`-only. Output must be minimal TOML: absent `Option`s, `false` bools, and empty lists are not written, so a serialized config reads like a hand-written one and re-parses to an equal value.
-`ProfileType::External` is `#[serde(skip)]` (API-only); leave that attribute as is — serializing an `External` profile is an error, which is correct.
-`ProfileConfig` serializes `password` as stored. That is the caller's responsibility (the GUI never stores inline passwords); state it in the type's doc comment.
-The crate's `toml` is a dev-dependency only; use it in tests, never in non-test code.
+P-09 claims large speedups for imported configs with thousands of rules. Every later phase is judged against these numbers, so they must come from the unmodified router. No new dependencies: use `std::time::Instant`, a hand-written deterministic generator (a 64-bit LCG: `state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)`), and build the config as a TOML string parsed with the existing dev-dependency `toml` into `RoutingConfig` / profiles, then `Router::from_input`. Examples may use dev-dependencies.
 
 ## Scope
-- In: `src/routing.rs`
-- Out: `Cargo.toml`, `Cargo.lock`, `src/router/`, every other `src/` file, `DOX.md`
+- In: `examples/route_bench.rs` (new)
+- Out: everything under `src/`, `Cargo.toml`, `Cargo.lock`, `tests/`
 
 ## Sub-tasks
-1. [done] In `src/routing.rs`, add `Serialize` next to `Deserialize` in the derives of `Inbound`, `OneOrMany`, `PortSpec`, `HostLevels`, `RuleConfig`, `RoutingTableConfig`, `RoutingConfig`, `ProfileType`, and `ProfileConfig`, and import it (`use serde::{Deserialize, Serialize};`) — done when: `cargo build --locked` and `cargo build --no-default-features --locked` succeed.
-2. [done] Add skip attributes, keeping every existing `#[serde(...)]` attribute: on each `Option<_>` field of `HostLevels`, `RuleConfig` (all except `target`), `RoutingTableConfig.default`, `RoutingConfig.http` / `.socks`, and `ProfileConfig` (all `Option` fields) add `skip_serializing_if = "Option::is_none"`; on the `bool` fields `RuleConfig.match_all`, `.disabled`, `.bypass_mitm`, `RoutingTableConfig.inherit`, `RoutingConfig.resolve_dns`, and `ProfileConfig.tls_insecure_skip_verify` add `skip_serializing_if = "std::ops::Not::not"`; on the `Vec` fields `RoutingTableConfig.rules`, `RoutingConfig.rules`, and `ProfileConfig.bypass` add `skip_serializing_if = "Vec::is_empty"`. Where a field already has `#[serde(default)]`, write `#[serde(default, skip_serializing_if = "...")]` — done when: `cargo clippy --all-targets --locked -- -D warnings` passes.
-3. [done] Add to `ProfileConfig`'s doc comment the sentence: `Serializing writes \`password\` as stored; callers that persist a config must not keep secrets inline.` — done when: `grep -c 'must not keep secrets inline' src/routing.rs` prints `1`.
-4. [done] In the existing `#[cfg(test)] mod tests` of `src/routing.rs`, add test `serialize_round_trips_every_field`: a TOML string with `[profiles.corp]` (type `https`, host, port, username, password_env, bypass, tls_insecure_skip_verify = true), `[profiles.split]` (type `composite`, http_proxy, fallback_proxy), and a `[routing]` with `default = ["corp", "direct"]`, `resolve_dns = true`, one rule setting every `RuleConfig` field (use `port = [22, "8000-8080"]`, `host_levels = { min = 1, max = 3 }`, `inbound = "http"`, `match_all = true`, `bypass_mitm = true`), plus `[routing.http]` with `inherit = true`; parse it into a test-local `#[derive(Debug, PartialEq, Serialize, Deserialize)] struct File { #[serde(default)] profiles: BTreeMap<String, ProfileConfig>, routing: RoutingConfig }` with `toml::from_str`, serialize with `toml::to_string`, parse again, and assert both values are equal — done when: `cargo test --locked serialize_round_trips_every_field` passes.
-5. [done] Add test `serialize_omits_defaults`: serialize a `RoutingConfig` holding one `RuleConfig` whose only set field is `target = "direct"` (all `Option`s `None`, bools `false`) and assert the output contains `target = "direct"` and none of `match_all`, `disabled`, `bypass_mitm`, `name`, `resolve_dns`, `http`, `socks` — done when: `cargo test --locked serialize_omits_defaults` passes.
+1. [done] Create `examples/route_bench.rs`. It declares one profile `p` (`type = "http"`, `host = "127.0.0.1"`, `port = 3128`) and, for each N in `[100, 1000, 5000]`, builds four configs of N `[[routing.rules]]` (all `target = "p"`, `[routing].default = "direct"`): **host** — rule i has `host = "h{i}.example"`; **wildcard** — rule i has `host_wildcard = "*.w{i}.example"`; **mixed** — rule i cycles through `host = "h{i}.example"`, `host_wildcard = "*.w{i}.example"`, `host_regex = "^r{i}\\."`, `cidr = "10.{i/256 % 256}.{i % 256}.0/24"`; **url** — rule i has `url_wildcard = "*://u{i}.example/*"`. Requests: 10 000 per config from the LCG (seed 42): 50% hit a random rule's host form (`h{k}.example`, `x.w{k}.example`, `r{k}.example`, `10.a.b.1`, or url `http://u{k}.example/path` with host `u{k}.example`), 50% miss (`miss{k}.other`) — done when: `cargo build --release --example route_bench --locked` succeeds.
+2. [done] For each (N, kind) run every request once to warm up, then time a second pass and print one line per case: `N=<n> kind=<kind> ns/route=<mean>` (mean over the 10 000 timed routes, integer nanoseconds); also print `rules compiled in <ms> ms` per config. Use `RouteRequest::new(Inbound::Http, host, 80)` and set `url` for the url kind (`RouteRequest` has a public `url` field; set `scheme` to `http`) — done when: `cargo run --release --example route_bench --locked` prints 12 `ns/route` lines.
+3. [done] Run it twice and record both outputs in `## Evidence` (the planner compares later phases against the slower of the two runs per line) — done when: both outputs are in Evidence.
 
 ## Verify
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo clippy --all-targets --no-default-features --locked -- -D warnings
-cargo test --locked
-cargo test --no-default-features --locked
-python3 scripts/check-pure-rust-crypto.py
-git diff --exit-code -- Cargo.toml Cargo.lock src/router
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo run --release --example route_bench --locked
+git diff --exit-code -- src Cargo.toml Cargo.lock tests
 ```
 
 ## Escalate when
-- A derive fails because a field type does not implement `Serialize` (other than `ProfileType::External`, which stays skipped) → stop, set Status: needs-human — reason: name the type and field.
-- The round-trip test fails with unequal values → stop, set Status: needs-human — reason: paste the two values (do not change the test's TOML to make it pass).
-- An existing test fails → stop, set Status: needs-human — reason: name the test and paste the failure.
+- A generated config fails to compile in `Router::from_input` → stop, set Status: needs-human — reason: paste the error and the first offending rule.
+- `RouteRequest` lacks a field this phase relies on → stop, set Status: needs-human — reason: name it (do not change `src/`).
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: imported `serde::Serialize` and derived `Serialize` on all 9 routing config types in `src/routing.rs`
-- sub-task 2: added `skip_serializing_if` attributes on all `Option`, `bool`, and `Vec` fields of `HostLevels`, `RuleConfig`, `RoutingTableConfig`, `RoutingConfig`, and `ProfileConfig`
-- sub-task 3: added password-serialization warning sentence to `ProfileConfig` doc comment
-- sub-task 4: added `serialize_round_trips_every_field` unit test in `src/routing.rs`
-- sub-task 5: added `serialize_omits_defaults` unit test in `src/routing.rs`
-- verify: ran all `## Verify` commands; all exited 0
+- sub-task 1: created `examples/route_bench.rs` with TOML config generator, deterministic LCG (seed 42) request generator, warm-up + timed pass, and `N=<n> kind=<kind> ns/route=<mean>` output
+- sub-task 2: ran `cargo run --release --example route_bench --locked`; printed 12 `ns/route` lines with compile times
+- sub-task 3: ran second pass of `route_bench` and recorded both baseline runs in Evidence; ran all `## Verify` commands and all passed
 
-- planner accepted phase-0001: re-ran ## Verify (225 default / 213 no-default tests, PURE_RUST_CRYPTO_OK), read the diff (in scope); wrapped the new ProfileConfig doc line to 100 columns (wrapped so the sub-task 3 phrase stays on one line)
+- planner accepted phase-0001: example reviewed (LCG requests, warm-up + timed pass, black_box), Verify output in Evidence; baseline per line = slower run (5000 host 7779 ns, 5000 wildcard 337235 ns)
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo build --locked && cargo build --no-default-features --locked` → exit 0 (both builds succeeded)
-- `cargo clippy --all-targets --locked -- -D warnings` → exit 0 (no warnings)
-- `grep -c 'must not keep secrets inline' src/routing.rs` → `1`
-- `cargo test --locked serialize_round_trips_every_field` → exit 0 (1 passed; 0 failed)
-- `cargo test --locked serialize_omits_defaults` → exit 0 (1 passed; 0 failed)
-- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py && git diff --exit-code -- Cargo.toml Cargo.lock src/router` → exit 0 (207+18 default tests passed, 196+17 no-default-features tests passed, `PURE_RUST_CRYPTO_OK`, out-of-scope files unchanged)
-- planner: `grep -c 'must not keep secrets inline' src/routing.rs` → 1 after the wrap
+- `cargo build --release --example route_bench --locked` → exit 0 (`Finished release profile [optimized] target(s) in 16.43s`)
+- `cargo run --release --example route_bench --locked` (run 1) → exit 0, 12 lines:
+  `N=100 kind=host ns/route=528 (rules compiled in 0 ms)`
+  `N=100 kind=wildcard ns/route=1372 (rules compiled in 4 ms)`
+  `N=100 kind=mixed ns/route=606 (rules compiled in 1 ms)`
+  `N=100 kind=url ns/route=744 (rules compiled in 0 ms)`
+  `N=1000 kind=host ns/route=1794 (rules compiled in 0 ms)`
+  `N=1000 kind=wildcard ns/route=19018 (rules compiled in 32 ms)`
+  `N=1000 kind=mixed ns/route=7862 (rules compiled in 9 ms)`
+  `N=1000 kind=url ns/route=8238 (rules compiled in 3 ms)`
+  `N=5000 kind=host ns/route=7779 (rules compiled in 1 ms)`
+  `N=5000 kind=wildcard ns/route=337235 (rules compiled in 156 ms)`
+  `N=5000 kind=mixed ns/route=57492 (rules compiled in 45 ms)`
+  `N=5000 kind=url ns/route=51179 (rules compiled in 15 ms)`
+- `cargo run --release --example route_bench --locked` (run 2) → exit 0, 12 lines:
+  `N=100 kind=host ns/route=295 (rules compiled in 0 ms)`
+  `N=100 kind=wildcard ns/route=1340 (rules compiled in 4 ms)`
+  `N=100 kind=mixed ns/route=554 (rules compiled in 0 ms)`
+  `N=100 kind=url ns/route=670 (rules compiled in 0 ms)`
+  `N=1000 kind=host ns/route=1507 (rules compiled in 0 ms)`
+  `N=1000 kind=wildcard ns/route=18628 (rules compiled in 30 ms)`
+  `N=1000 kind=mixed ns/route=7667 (rules compiled in 8 ms)`
+  `N=1000 kind=url ns/route=7833 (rules compiled in 2 ms)`
+  `N=5000 kind=host ns/route=7436 (rules compiled in 0 ms)`
+  `N=5000 kind=wildcard ns/route=177968 (rules compiled in 150 ms)`
+  `N=5000 kind=mixed ns/route=51505 (rules compiled in 43 ms)`
+  `N=5000 kind=url ns/route=43971 (rules compiled in 14 ms)`
+- `cargo fmt --check` → exit 0
+- `cargo clippy --all-targets --all-features --locked -- -D warnings` → exit 0
+- `cargo clippy --all-targets --no-default-features --locked -- -D warnings` → exit 0
+- `git diff --exit-code -- src Cargo.toml Cargo.lock tests` → exit 0

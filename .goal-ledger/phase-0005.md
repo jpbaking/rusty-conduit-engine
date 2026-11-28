@@ -1,47 +1,52 @@
-# phase-0005 — test-support: shared test fixtures
+# phase-0005 — Reload-safe counters, divergence entries, docs, and after-numbers
 
 - Status: done
-- Owner: executor
+- Owner: planner
 - Depends on: phase-0004
-- Goal: Publish the test fixtures rusty-conduit and rusty-conduit-ssh both copy (logger capture, echo server, HTTP origin, test CA, TLS client, connect-through helper) as `rusty_conduit_engine::test_support` behind the `test-support` feature.
-- Done when: every command in `## Verify` exits 0, and a smoke test exercises each published helper.
-- Pattern to follow: `../rusty-conduit/src/test_support.rs:1-270` (copy it; it is the reference copy, ssh's differs only in `TestCa.cert_der` type and doc wording)
+- Goal: Give embedders a reload path that keeps counters only for profiles and rules that still exist and resets an unnamed rule's counter when the rule at that position changed (B-07 engine support), record every behavior change, document the index, and publish before/after benchmark numbers.
+- Done when: every command in `## Verify` exits 0; reload counter tests cover pruning and the unnamed-rule reset; divergence entries exist for every behavior change of this goal; `DOX.md` and `src/router/DOX.md` describe the index.
+- Pattern to follow: `src/routing.rs` `RoutingState::with_counters`; `../rusty-conduit-switch/src/reload.rs:256-270` (how switch carries counters across a reload today; read-only)
 
 ## Context
-`../rusty-conduit/src/test_support.rs` is a `#[cfg(test)]` module used by that crate's unit tests. Every engine item it uses is already public (`http::mitm_tunnel::client_config_with_roots`, `mitm::ca::CaMaterial`, `mitm::crypto_provider`, `mitm::signer::LeafSigner`, `logging::*`), and every crate it uses (`bytes`, `http-body-util`, `hyper`, `hyper-util`, `rcgen`, `rustls`, `time`, `tokio`, `tokio-rustls`) is already a normal engine dependency, so the planner made `test-support = []`. Inside the engine its `crate::` paths stay valid. Make each item `pub` (it was `pub(crate)` or private-to-module), keep behavior and names unchanged, and add a `//!` module doc saying it is for consumers' tests and is not covered by semver stability.
+B-07: switch passes the previous `RoutingCounters` to the new state on every reload, so counters of removed profiles and rules live forever, and an unnamed rule keyed `[routing] rule #N` inherits another rule's totals when rules are inserted or reordered. Decision: add `RoutingState::with_counters_from(previous: &RoutingState)`, which shares the previous counters, drops entries whose profile or rule label is absent from the new router (keeping `direct`, `block`, and the default label), and resets an unnamed rule's counter when its compiled rule's fingerprint (a hash of its `RuleConfig`, now `Serialize`) differs from the previous router's rule with that label. `with_counters` keeps its current meaning. Switch adopts the new call in Phase 3b.
 
 ## Scope
-- In: `src/test_support.rs`
-- Out: `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, every other `src/` file, the consumer repos (read-only sources)
+- In: `src/routing.rs`, `src/router/mod.rs` (fingerprint on compiled rules), `docs/DIVERGENCE-LEDGER.md`, `DOX.md`, `src/router/DOX.md`, `docs/TODO.md`
+- Out: `Cargo.toml`, `Cargo.lock`, the consumer repos
 
 ## Sub-tasks
-1. [done] Replace the planner's empty `src/test_support.rs` with the contents of `../rusty-conduit/src/test_support.rs`, keeping the planner's module doc at the top; change every item's visibility to `pub` (struct fields that tests read, e.g. `TestCa` / `Origin` fields, too) — done when: `cargo build --features test-support --locked` succeeds.
-2. [done] Add `#[cfg(test)] mod tests` at the end of `src/test_support.rs` with `#[tokio::test] async fn fixtures_work()`: start `spawn_echo` on `127.0.0.1:0` and check `echo_roundtrip` returns its input; build `test_ca()` and assert its cert DER is non-empty; start `spawn_origin` and fetch one response with a plain TCP request; use `quiet_logger()` once — done when: `cargo test --features test-support --locked test_support` passes.
+1. [done] `with_counters_from` with pruning and the unnamed-rule reset — done when: unit tests cover removed profile, removed rule, unchanged unnamed rule (kept), and changed unnamed rule (reset).
+2. [done] Divergence entries for phases 0002–0005 (expected: none for matching, which must be identical; one for the new reload API; any found difference) — done when: entries exist and name their tests.
+3. [done] Docs and final benchmark table (baseline vs after, both runs) in Evidence — done when: the DOX files mention the index and `with_counters_from`.
 
 ## Verify
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked
+cargo test --no-default-features --locked
 cargo test --all-features --locked
-cargo test --features test-support --locked test_support
-git diff --exit-code -- Cargo.toml Cargo.lock src/lib.rs src/routing.rs src/cli_support
+python3 scripts/check-pure-rust-crypto.py
+cargo run --release --example route_bench --locked
+git diff --exit-code -- Cargo.toml Cargo.lock
 ```
 
 ## Escalate when
-- The copied file needs a dependency that is not already in `Cargo.toml` → stop, set Status: needs-human — reason: name the crate (do not edit `Cargo.toml`).
-- A helper's signature does not match the smoke-test description above → write the smoke test against the real signature and note it in `## Log`; anything beyond that → stop, set Status: needs-human — reason: describe it.
+- The fingerprint would reset counters on reloads where nothing changed → stop and fix before continuing (counters are user-visible).
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: copied `../rusty-conduit/src/test_support.rs` into `src/test_support.rs` preserving the planner's module doc; all public fixtures and struct fields (`Buf`, `TestCa`, `Origin`) are `pub`.
-- sub-task 2: added `#[cfg(test)] mod tests` with `fixtures_work()` exercising `quiet_logger`, `capture_access`, `spawn_echo`/`echo_roundtrip`, `test_ca`, and `spawn_origin` + `tls_client` (note: `spawn_origin` is an HTTP/1.1 TLS origin rather than plain TCP, so the smoke test connects over TLS via `tls_client` trusting `origin.ca_der`).
-- verify: all 6 `## Verify` commands passed cleanly.
-
-- planner accepted phase-0005: diff vs ../rusty-conduit/src/test_support.rs is only the module doc plus the smoke test; Verify re-run (243 all-features; test-support-only lib clippy clean)
+- planner begins phase-0005 (planner-owned)
+- sub-task 1: `CompiledRule` gains `named` and a `fingerprint` (DefaultHasher over the rule's serde_json form; fixed SipHash keys, stable within a process); `Router::rule_labels`; `RoutingCounters::retain`; `RoutingState::with_counters_from(&previous)` keeps named rules, the default label, unchanged unnamed rules, and profiles the new router or registry knows
+- sub-task 2: M-19 (P-09 performance, keep; notes the `Condition` payload change) and M-20 (new reload API, option)
+- sub-task 3: DOX (contract note on the clock memo, Feature Map for the index, `CompiledFilter`, `with_counters_from`, the benchmark), src/router/DOX.md (index contract and Feature Map), docs/TODO.md (net.rs filter scan, PinnedRouting, URL/mixed rules still linear)
+- found while benchmarking: one segment per non-indexed rule cost ≈10% on URL-only tables; consecutive non-indexed rules now form one linear range (URL back at baseline, mixed 30 µs vs 51–57 µs baseline)
+- phase-0005 verified and closed
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo build --features test-support --locked` → exit 0 (`Finished dev profile ... in 2.73s`)
-- `cargo test --features test-support --locked test_support` → exit 0 (`test test_support::tests::fixtures_work ... ok`; 1 passed, 0 failed)
-- `cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo clippy --all-targets --locked -- -D warnings && cargo test --features test-support --locked test_support && cargo test --all-features --locked && git diff --exit-code -- Cargo.toml Cargo.lock src/lib.rs src/routing.rs src/cli_support` → exit 0 (fmt clean, both clippy checks clean, 225 unit + 18 integration = 243 all-features tests passed, out-of-scope diff empty)
+- `cargo test --locked --lib with_counters_from` → ok (unchanged reload keeps all; removed profile `b` and moved unnamed rules #2/#3 reset; named rule, default label, built-in `direct` kept)
+- Full verification → exit 0 (fmt; clippy default / no-default / all-features; 721 tests across the three test runs; PURE_RUST_CRYPTO_OK); `git diff --exit-code -- Cargo.toml Cargo.lock` → exit 0
+- final benchmark (release, two runs) vs baseline (slower phase-0001 run): N=5000 host 73–76 ns vs 7779 ns (≈100×); wildcard 86 ns vs 337235 ns (≈3900×); mixed 30.2–30.4 µs vs 57.5 µs; url 44.0–45.0 µs vs 51.2 µs; N=1000 host/wildcard ≈80 ns vs 1.8 µs / 19.0 µs

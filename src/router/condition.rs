@@ -19,9 +19,12 @@
 //! (or globally); even then the lookup happens lazily, at most once per routing decision, and
 //! only when a CIDR condition is actually evaluated against a hostname.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "routing")]
 use regex::{Regex, RegexBuilder};
@@ -151,9 +154,33 @@ pub trait Clock: Send + Sync {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
+/// `SystemClock`'s last answer, packed as `unix_minute << 14 | weekday << 11 | minute_of_day`
+/// (`0` = none yet). Local time changes only at minute boundaries, so the value for the
+/// current unix minute is exact; it only saves the `now_local()` call (glibc's
+/// `localtime_r` takes a process-wide lock) for every request evaluated in that minute.
+static LOCAL_MINUTE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static LOCAL_TIME_QUERIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl Clock for SystemClock {
     fn now(&self) -> LocalTime {
-        LocalTime::now()
+        let minute = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / 60);
+        let cached = LOCAL_MINUTE.load(Ordering::Relaxed);
+        if cached != 0 && cached >> 14 == minute {
+            return LocalTime {
+                weekday: ((cached >> 11) & 0x7) as u8,
+                minute_of_day: (cached & 0x7ff) as u16,
+            };
+        }
+        #[cfg(test)]
+        LOCAL_TIME_QUERIES.fetch_add(1, Ordering::Relaxed);
+        let now = LocalTime::now();
+        let packed = minute << 14 | u64::from(now.weekday) << 11 | u64::from(now.minute_of_day);
+        LOCAL_MINUTE.store(packed, Ordering::Relaxed);
+        now
     }
 }
 
@@ -241,6 +268,21 @@ impl<'a> MatchContext<'a> {
     fn resolved(&self) -> &[IpAddr] {
         self.resolved
             .get_or_init(|| self.resolver.resolve(self.host, self.port))
+    }
+}
+
+/// [`normalize_host`] that borrows `host` when it is already normal (the common case).
+pub(crate) fn normalize_host_cow(host: &str) -> Cow<'_, str> {
+    let trimmed = host.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let bare = bare.strip_suffix('.').unwrap_or(bare);
+    if bare.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(bare.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(bare)
     }
 }
 
@@ -451,6 +493,185 @@ fn alternation(
         .collect::<Vec<_>>()
         .join("|");
     build_regex(field, &joined, case_insensitive)
+}
+
+/// Build one regex per `sources` entry, or (when they combine) a single alternation that
+/// matches exactly when one of them does. Falls back to separate regexes when the combined
+/// pattern cannot be built (for example the compiled-size limit), so errors and results stay
+/// those of the individual patterns.
+fn regex_list(
+    field: &'static str,
+    sources: &[String],
+    case_insensitive: bool,
+) -> Result<Vec<Regex>, ConditionError> {
+    let each = sources
+        .iter()
+        .map(|s| build_regex(field, s, case_insensitive))
+        .collect::<Result<Vec<_>, _>>()?;
+    if each.len() < 2 {
+        return Ok(each);
+    }
+    Ok(match alternation(field, sources, case_insensitive) {
+        Ok(one) => vec![one],
+        Err(_) => each,
+    })
+}
+
+/// Lists up to this long are scanned; longer ones are hashed (hashing per rule costs more
+/// than a few direct comparisons, which usually fail on the first bytes).
+const SMALL_SET: usize = 8;
+
+/// A set of lowercase names: scanned when small, hashed when large.
+#[derive(Debug, Clone)]
+pub enum NameSet {
+    Few(Vec<String>),
+    /// Boxed so a small set stays as compact as a plain `Vec`.
+    Many(Box<HashSet<String>>),
+}
+
+impl NameSet {
+    fn from_names(mut names: Vec<String>) -> Self {
+        names.sort();
+        names.dedup();
+        if names.len() <= SMALL_SET {
+            Self::Few(names)
+        } else {
+            Self::Many(Box::new(names.into_iter().collect()))
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Few(v) => v.is_empty(),
+            Self::Many(s) => s.is_empty(),
+        }
+    }
+
+    /// The names, in no particular order.
+    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Self::Few(v) => Box::new(v.iter().map(String::as_str)),
+            Self::Many(s) => Box::new(s.iter().map(String::as_str)),
+        }
+    }
+
+    /// Whether `name` is in the set.
+    pub fn contains(&self, name: &str) -> bool {
+        match self {
+            Self::Few(v) => v.iter().any(|n| n == name),
+            Self::Many(s) => s.contains(name),
+        }
+    }
+
+    /// Whether `host` ends with `.d` for some `d` in the set (with `apex`, also `host == d`).
+    fn has_suffix_of(&self, host: &str, apex: bool) -> bool {
+        match self {
+            Self::Few(v) => v.iter().any(|d| {
+                (apex && host == d)
+                    || host
+                        .strip_suffix(d.as_str())
+                        .is_some_and(|rest| rest.ends_with('.'))
+            }),
+            Self::Many(s) => {
+                (apex && s.contains(host))
+                    || host
+                        .bytes()
+                        .enumerate()
+                        .any(|(i, b)| b == b'.' && s.contains(&host[i + 1..]))
+            }
+        }
+    }
+}
+
+/// A compiled `host_wildcard` field. Plain-name, `*.domain`, `**.domain`, and `*` patterns
+/// are answered from hash sets by walking the host's label suffixes; every other pattern
+/// stays in a residual regex. Non-ASCII hosts always use the full regex, because its
+/// case-insensitive Unicode matching can fold characters (`K` → `k`) that the sets do not.
+#[derive(Debug, Clone)]
+pub struct HostWildcardMatcher {
+    /// The whole field as one regex (the reference semantics).
+    full: Regex,
+    any: bool,
+    exact: NameSet,
+    /// `*.d`: `d` and its subdomains.
+    apex_and_subdomains: NameSet,
+    /// `**.d`: subdomains of `d` only.
+    subdomains: NameSet,
+    residual: Option<Regex>,
+}
+
+impl HostWildcardMatcher {
+    fn compile(patterns: &[String]) -> Result<Self, ConditionError> {
+        let sources: Vec<String> = patterns.iter().map(|p| host_wildcard_regex(p)).collect();
+        // Compiled first, so errors (and the no-`routing` rejection) are unchanged.
+        let full = alternation("host_wildcard", &sources, true)?;
+        let mut any = false;
+        let (mut exact, mut apex, mut sub) = (Vec::new(), Vec::new(), Vec::new());
+        let plain = |s: &str| !s.is_empty() && s.is_ascii() && !s.contains(['*', '?']);
+        let mut rest = Vec::new();
+        for (pattern, source) in patterns.iter().zip(sources) {
+            let p = if pattern.starts_with('.') {
+                format!("*{pattern}")
+            } else {
+                pattern.clone()
+            };
+            if p == "*" {
+                any = true;
+            } else if let Some(d) = p.strip_prefix("**.").filter(|d| plain(d)) {
+                sub.push(d.to_ascii_lowercase());
+            } else if let Some(d) = p.strip_prefix("*.").filter(|d| plain(d)) {
+                apex.push(d.to_ascii_lowercase());
+            } else if plain(&p) {
+                exact.push(p.to_ascii_lowercase());
+            } else {
+                rest.push(source);
+            }
+        }
+        let residual = if rest.is_empty() {
+            None
+        } else {
+            Some(alternation("host_wildcard", &rest, true)?)
+        };
+        Ok(Self {
+            full,
+            any,
+            exact: NameSet::from_names(exact),
+            apex_and_subdomains: NameSet::from_names(apex),
+            subdomains: NameSet::from_names(sub),
+            residual,
+        })
+    }
+
+    /// Whether the (normalized) host matches any pattern.
+    pub fn is_match(&self, host: &str) -> bool {
+        if !host.is_ascii() {
+            return self.full.is_match(host);
+        }
+        if self.any {
+            return true;
+        }
+        let host_lower;
+        let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+            host_lower = host.to_ascii_lowercase();
+            host_lower.as_str()
+        } else {
+            host
+        };
+        if self.exact.contains(host)
+            || (!self.apex_and_subdomains.is_empty()
+                && self.apex_and_subdomains.has_suffix_of(host, true))
+            || (!self.subdomains.is_empty() && self.subdomains.has_suffix_of(host, false))
+        {
+            return true;
+        }
+        self.residual.as_ref().is_some_and(|re| re.is_match(host))
+    }
+
+    /// The reference regex for the whole field (tests compare against it).
+    #[cfg(all(test, feature = "routing"))]
+    fn full_is_match(&self, host: &str) -> bool {
+        self.full.is_match(host)
+    }
 }
 
 /// Values of a list field, rejecting an explicitly empty list.
@@ -720,8 +941,9 @@ fn parse_port_spec(spec: &PortSpec) -> Result<(u16, u16), ConditionError> {
 pub enum Condition {
     Inbound(Inbound),
     /// Exact normalized hostnames.
-    Host(Vec<String>),
-    HostWildcard(Regex),
+    Host(NameSet),
+    /// Boxed so the common conditions stay small (rules are scanned in bulk).
+    HostWildcard(Box<HostWildcardMatcher>),
     HostRegex(Vec<Regex>),
     /// `cidr` / `ip` networks; hostnames are resolved only when `resolve_dns`.
     Cidr {
@@ -758,8 +980,8 @@ impl Condition {
     pub fn matches(&self, ctx: &MatchContext<'_>) -> bool {
         match self {
             Self::Inbound(i) => ctx.inbound == *i,
-            Self::Host(hosts) => hosts.iter().any(|h| h == ctx.host),
-            Self::HostWildcard(re) => re.is_match(ctx.host),
+            Self::Host(hosts) => hosts.contains(ctx.host),
+            Self::HostWildcard(m) => m.is_match(ctx.host),
             Self::HostRegex(res) => res.iter().any(|re| re.is_match(ctx.host)),
             Self::Cidr { nets, resolve_dns } => match ctx.ip {
                 Some(ip) => nets.iter().any(|n| n.contains(ip)),
@@ -804,6 +1026,56 @@ pub struct RuleMatcher {
     pub disabled: bool,
 }
 
+/// The host keys of a rule whose only condition is `host` or `host_wildcard` (see
+/// [`RuleMatcher::host_only`]), for the router's first-match index.
+pub(crate) enum HostOnly<'a> {
+    /// A disabled rule: never matches.
+    Never,
+    Keys {
+        /// Exact names (`host` values and plain `host_wildcard` patterns).
+        exact: Vec<&'a str>,
+        /// `*.d`: `d` and its subdomains.
+        apex_and_subdomains: Vec<&'a str>,
+        /// `**.d`: subdomains of `d` only.
+        subdomains: Vec<&'a str>,
+        /// A `*` pattern: matches every host.
+        any: bool,
+        /// Some patterns are only answered by the rule's own matcher.
+        residual: bool,
+    },
+}
+
+impl RuleMatcher {
+    /// Classify this rule for the first-match index: `None` when it has any condition other
+    /// than a single `host` or `host_wildcard` (or is `match_all`), so it must be evaluated
+    /// on its own. The keys are lowercase ASCII; the index answers ASCII hosts only.
+    pub(crate) fn host_only(&self) -> Option<HostOnly<'_>> {
+        if self.disabled {
+            return Some(HostOnly::Never);
+        }
+        if self.match_all {
+            return None;
+        }
+        match self.conditions.as_slice() {
+            [Condition::Host(names)] => Some(HostOnly::Keys {
+                exact: names.iter().collect(),
+                apex_and_subdomains: Vec::new(),
+                subdomains: Vec::new(),
+                any: false,
+                residual: false,
+            }),
+            [Condition::HostWildcard(m)] => Some(HostOnly::Keys {
+                exact: m.exact.iter().collect(),
+                apex_and_subdomains: m.apex_and_subdomains.iter().collect(),
+                subdomains: m.subdomains.iter().collect(),
+                any: m.any,
+                residual: m.residual.is_some(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 impl RuleMatcher {
     /// Compile a rule. `global_resolve_dns` is `[routing].resolve_dns`; the rule's own
     /// `resolve_dns` overrides it.
@@ -820,22 +1092,16 @@ impl RuleMatcher {
             if hosts.iter().any(String::is_empty) {
                 return Err(ConditionError::new("host", "contains an empty hostname"));
             }
-            c.push(Condition::Host(hosts));
+            c.push(Condition::Host(NameSet::from_names(hosts)));
         }
         if let Some(v) = &rule.host_wildcard {
             let pats = split_patterns("host_wildcard", values("host_wildcard", v)?)?;
-            let sources: Vec<String> = pats.iter().map(|p| host_wildcard_regex(p)).collect();
-            c.push(Condition::HostWildcard(alternation(
-                "host_wildcard",
-                &sources,
-                true,
-            )?));
+            c.push(Condition::HostWildcard(Box::new(
+                HostWildcardMatcher::compile(&pats)?,
+            )));
         }
         if let Some(v) = &rule.host_regex {
-            let res = values("host_regex", v)?
-                .iter()
-                .map(|s| build_regex("host_regex", s, false))
-                .collect::<Result<Vec<_>, _>>()?;
+            let res = regex_list("host_regex", values("host_regex", v)?, false)?;
             c.push(Condition::HostRegex(res));
         }
         let mut nets = Vec::new();
@@ -903,10 +1169,7 @@ impl RuleMatcher {
             )?));
         }
         if let Some(v) = &rule.url_regex {
-            let res = values("url_regex", v)?
-                .iter()
-                .map(|s| build_regex("url_regex", s, false))
-                .collect::<Result<Vec<_>, _>>()?;
+            let res = regex_list("url_regex", values("url_regex", v)?, false)?;
             c.push(Condition::UrlRegex(res));
         }
         if let Some(v) = &rule.keyword {
@@ -962,8 +1225,8 @@ impl RuleMatcher {
     pub fn may_match_host_port(&self, host: &str, ip: Option<IpAddr>, port: u16) -> bool {
         !self.disabled
             && self.conditions.iter().all(|c| match c {
-                Condition::Host(hosts) => hosts.iter().any(|h| h == host),
-                Condition::HostWildcard(re) => re.is_match(host),
+                Condition::Host(hosts) => hosts.contains(host),
+                Condition::HostWildcard(m) => m.is_match(host),
                 Condition::HostRegex(res) => res.iter().any(|re| re.is_match(host)),
                 Condition::Cidr { nets, resolve_dns } => match ip {
                     Some(ip) => nets.iter().any(|n| n.contains(ip)),
@@ -989,6 +1252,46 @@ impl RuleMatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_clock_queries_the_local_time_once_per_minute() {
+        // Another test may run in the same minute; count the delta of two back-to-back calls.
+        let first = SystemClock.now();
+        let before = LOCAL_TIME_QUERIES.load(Ordering::Relaxed);
+        let second = SystemClock.now();
+        let after = LOCAL_TIME_QUERIES.load(Ordering::Relaxed);
+        if first.minute_of_day == second.minute_of_day {
+            assert_eq!(
+                after, before,
+                "a second call in the same minute must use the cache"
+            );
+            assert_eq!(first, second);
+        }
+        let real = LocalTime::now();
+        assert!(second.weekday < 7 && second.minute_of_day < 1440);
+        // Same minute unless the clock ticked over between the calls.
+        assert!(real == second || real.minute_of_day != second.minute_of_day);
+    }
+
+    #[test]
+    fn normalize_host_cow_matches_normalize_host() {
+        for host in [
+            "example.com",
+            "Example.COM.",
+            " [::1] ",
+            "[FE80::1]",
+            "a.",
+            "",
+            "é.Lan",
+            "x",
+        ] {
+            assert_eq!(normalize_host_cow(host), normalize_host(host), "{host:?}");
+        }
+        assert!(matches!(
+            normalize_host_cow("example.com"),
+            Cow::Borrowed(_)
+        ));
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CountingResolver {
@@ -1087,6 +1390,121 @@ mod tests {
         assert!(host_matches(&m, "b.example"));
         assert!(!host_matches(&m, "www.example.com"));
         assert!(compile_err("host = []").message.contains("at least one"));
+    }
+
+    /// Small deterministic generator for the equivalence tests (no `rand` dependency).
+    #[cfg(feature = "routing")]
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    #[cfg(feature = "routing")]
+    #[test]
+    fn host_wildcard_fast_paths_agree_with_the_full_regex() {
+        let patterns = [
+            "*.example.com",
+            "**.example.com",
+            ".lan",
+            "example.org",
+            "*",
+            "dev-*.corp.net",
+            "h?st.local",
+            "*.example.*",
+            "a+b.example",
+            "*.Mixed.Case",
+            "**.deep.a.b",
+            "exact.only",
+            "*.",
+            "**",
+            "*.é.example",
+            "x.*.example",
+            "*.a..b",
+        ];
+        let mut hosts: Vec<String> = [
+            "example.com",
+            "www.example.com",
+            "a.b.example.com",
+            "badexample.com",
+            "example.com.evil",
+            "lan",
+            "nas.lan",
+            "example.org",
+            "x.example.org",
+            "dev-1.corp.net",
+            "host.local",
+            "hoost.local",
+            "example.anything",
+            "a+b.example",
+            "mixed.case",
+            "q.mixed.case",
+            "deep.a.b",
+            "z.deep.a.b",
+            "exact.only",
+            "",
+            "\u{212a}.example.com",
+            "café.example",
+            "x.é.example",
+            "x.y.example",
+            "q.a..b",
+            "WWW.EXAMPLE.COM",
+        ]
+        .iter()
+        .map(|h| h.to_string())
+        .collect();
+        let mut state = 7u64;
+        let labels = [
+            "example", "com", "lan", "a", "b", "deep", "corp", "net", "x", "dev-1",
+        ];
+        for _ in 0..2000 {
+            let n = 1 + lcg(&mut state) % 4;
+            let host: Vec<&str> = (0..n)
+                .map(|_| labels[(lcg(&mut state) % labels.len() as u64) as usize])
+                .collect();
+            hosts.push(host.join("."));
+        }
+        // Every pattern alone, and all of them in one field.
+        let mut fields: Vec<Vec<String>> = patterns.iter().map(|p| vec![p.to_string()]).collect();
+        fields.push(patterns.iter().map(|p| p.to_string()).collect());
+        for field in fields {
+            let m = HostWildcardMatcher::compile(&field).unwrap();
+            for host in &hosts {
+                assert_eq!(
+                    m.is_match(host),
+                    m.full_is_match(host),
+                    "patterns {field:?} host {host:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "routing")]
+    #[test]
+    fn combined_regex_lists_agree_with_separate_regexes() {
+        let sources: Vec<String> = ["^r1\\.", "(?i)^MIXED$", "corp$", "^a|b$", "x{2,}"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let combined = regex_list("host_regex", &sources, false).unwrap();
+        assert_eq!(combined.len(), 1, "patterns combine into one regex");
+        let separate: Vec<Regex> = sources
+            .iter()
+            .map(|s| build_regex("host_regex", s, false).unwrap())
+            .collect();
+        for host in [
+            "r1.x", "r10.x", "mixed", "MIXED", "my.corp", "corp.x", "a", "zb", "axx", "q",
+        ] {
+            assert_eq!(
+                combined.iter().any(|re| re.is_match(host)),
+                separate.iter().any(|re| re.is_match(host)),
+                "{host}"
+            );
+        }
+        let err =
+            regex_list("host_regex", &["ok".to_string(), "(".to_string()], false).unwrap_err();
+        assert!(err.message.contains("\"(\""), "{}", err.message);
     }
 
     #[cfg(feature = "routing")]

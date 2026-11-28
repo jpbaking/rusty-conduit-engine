@@ -7,6 +7,7 @@
 //! ([`crate::net::connect_upstream_filtered`]), both domain rules and resolved-IP IP/CIDR rules
 //! are enforced before connecting (blocking DNS-to-loopback / DNS-rebinding bypasses).
 
+use std::collections::HashSet;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -256,14 +257,31 @@ impl HostFilter {
 
     /// Check a destination host string (literal IP or domain) without resolving DNS.
     pub fn check_host(&self, host: &str) -> Result<(), AccessDenied> {
+        let any =
+            |rules: &[FilterRule], domain: &str| rules.iter().any(|r| r.matches_domain(domain));
+        self.check_host_with(
+            host,
+            |domain| any(self.allow_rules(), domain),
+            |domain| any(self.block_rules(), domain),
+        )
+    }
+
+    /// [`Self::check_host`] with the domain membership tests supplied by the caller, so an
+    /// indexed form ([`CompiledFilter`]) gives the same decisions and messages.
+    fn check_host_with(
+        &self,
+        host: &str,
+        in_allow: impl Fn(&str) -> bool,
+        in_block: impl Fn(&str) -> bool,
+    ) -> Result<(), AccessDenied> {
         let bare = strip_brackets(host);
         if let Ok(ip) = bare.parse::<IpAddr>() {
             return self.check_ip(ip);
         }
         let domain = normalize_domain(bare);
         match self {
-            Self::Allow(rules) => {
-                if rules.iter().any(|r| r.matches_domain(&domain)) {
+            Self::Allow(_) => {
+                if in_allow(&domain) {
                     Ok(())
                 } else {
                     Err(AccessDenied(format!(
@@ -271,17 +289,17 @@ impl HostFilter {
                     )))
                 }
             }
-            Self::Block(rules) => {
-                if rules.iter().any(|r| r.matches_domain(&domain)) {
+            Self::Block(_) => {
+                if in_block(&domain) {
                     Err(AccessDenied(format!("destination {host} is blocklisted")))
                 } else {
                     Ok(())
                 }
             }
-            Self::BlockExcept { block, allow } => {
-                if allow.iter().any(|r| r.matches_domain(&domain)) {
+            Self::BlockExcept { .. } => {
+                if in_allow(&domain) {
                     Ok(())
-                } else if block.iter().any(|r| r.matches_domain(&domain)) {
+                } else if in_block(&domain) {
                     Err(AccessDenied(format!("destination {host} is blocklisted")))
                 } else {
                     Ok(())
@@ -319,6 +337,69 @@ impl HostFilter {
                 }
             }
         }
+    }
+}
+
+/// The domain rules of one list, indexed: exact names and `*.suffix` (subdomains only).
+#[derive(Debug, Clone, Default)]
+struct DomainIndex {
+    exact: HashSet<String>,
+    subdomains_of: HashSet<String>,
+}
+
+impl DomainIndex {
+    fn new(rules: &[FilterRule]) -> Self {
+        let mut index = Self::default();
+        for rule in rules {
+            match rule {
+                FilterRule::DomainExact(d) => {
+                    index.exact.insert(d.clone());
+                }
+                FilterRule::DomainWildcard(d) => {
+                    index.subdomains_of.insert(d.clone());
+                }
+                FilterRule::Ip(_) | FilterRule::Cidr { .. } => {}
+            }
+        }
+        index
+    }
+
+    /// Same answer as `rules.iter().any(|r| r.matches_domain(domain))`.
+    fn matches(&self, domain: &str) -> bool {
+        if self.exact.contains(domain) {
+            return true;
+        }
+        // `*.d` needs at least one character before the `.` that precedes `d`.
+        !self.subdomains_of.is_empty()
+            && domain
+                .bytes()
+                .enumerate()
+                .any(|(i, b)| b == b'.' && i >= 1 && self.subdomains_of.contains(&domain[i + 1..]))
+    }
+}
+
+/// A [`HostFilter`] with its domain rules indexed for the per-request routing check. Same
+/// decisions and messages as [`HostFilter::check_host`], in time independent of list length
+/// (IP/CIDR rules are still scanned).
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledFilter {
+    filter: HostFilter,
+    allow: DomainIndex,
+    block: DomainIndex,
+}
+
+impl CompiledFilter {
+    pub(crate) fn new(filter: HostFilter) -> Self {
+        Self {
+            allow: DomainIndex::new(filter.allow_rules()),
+            block: DomainIndex::new(filter.block_rules()),
+            filter,
+        }
+    }
+
+    pub(crate) fn check_host(&self, host: &str) -> Result<(), AccessDenied> {
+        self.filter
+            .check_host_with(host, |d| self.allow.matches(d), |d| self.block.matches(d))
     }
 }
 
@@ -407,6 +488,70 @@ fn validate_domain(domain: &str, raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compiled_filter_agrees_with_check_host() {
+        let mut state = 11u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        let labels = ["ads", "example", "com", "corp", "a", "b", "cdn", "x"];
+        let mut name = |n: u64| -> String {
+            (0..1 + n % 3)
+                .map(|_| labels[(next() % labels.len() as u64) as usize])
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let mut rules = |count: usize, salt: u64| -> Vec<FilterRule> {
+            (0..count)
+                .map(|i| {
+                    let d = name(salt + i as u64);
+                    let raw = match i % 4 {
+                        0 => format!("*.{d}"),
+                        1 => d,
+                        2 => "10.0.0.0/8".to_string(),
+                        _ => "192.0.2.1".to_string(),
+                    };
+                    raw.parse().unwrap()
+                })
+                .collect()
+        };
+        let allow = rules(40, 1);
+        let block = rules(40, 2);
+        let filters = [
+            HostFilter::Allow(allow.clone()),
+            HostFilter::Block(block.clone()),
+            HostFilter::BlockExcept { block, allow },
+        ];
+        let mut hosts: Vec<String> = (0..1500).map(&mut name).collect();
+        hosts.extend(
+            [
+                "ADS.Example.com.",
+                "[::1]",
+                "10.1.2.3",
+                "192.0.2.1",
+                "a",
+                ".com",
+                "x..com",
+            ]
+            .iter()
+            .map(|h| h.to_string()),
+        );
+        for filter in filters {
+            let compiled = CompiledFilter::new(filter.clone());
+            for host in &hosts {
+                assert_eq!(
+                    compiled.check_host(host),
+                    filter.check_host(host),
+                    "{} {host:?}",
+                    filter.mode_str()
+                );
+            }
+        }
+    }
 
     fn rule(s: &str) -> FilterRule {
         s.parse().unwrap()

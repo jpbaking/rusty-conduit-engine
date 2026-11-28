@@ -850,6 +850,12 @@ impl RoutingCounters {
         Self::default()
     }
 
+    /// Drop the counters whose rule label or profile name the predicates reject.
+    fn retain(&self, keep_rule: impl Fn(&str) -> bool, keep_profile: impl Fn(&str) -> bool) {
+        self.inner.rules.retain(|k, _| keep_rule(k));
+        self.inner.profiles.retain(|k, _| keep_profile(k));
+    }
+
     /// Counters of profile `name`, if it has served anything yet.
     pub fn profile(&self, name: &str) -> Option<TrafficSnapshot> {
         self.inner.profiles.get(name).map(|c| c.snapshot())
@@ -1171,6 +1177,30 @@ impl RoutingState {
         self
     }
 
+    /// On reload: share `previous`'s counters, keeping only those that still describe this
+    /// configuration. Counters of removed rules and of profiles neither this router nor this
+    /// registry knows are dropped, and an unnamed rule (labelled by position, such as
+    /// `[routing] rule #3`) starts from zero when the rule at that position changed, so it
+    /// does not inherit another rule's totals. Named rules and the table-default label keep
+    /// their counters. Requests in flight at the swap still finish on their own counters.
+    pub fn with_counters_from(mut self, previous: &RoutingState) -> Self {
+        let old = previous.router.rule_labels();
+        let new = self.router.rule_labels();
+        let router = Arc::clone(&self.router);
+        let registry = Arc::clone(&self.registry);
+        previous.counters.retain(
+            |label| {
+                label == crate::router::DEFAULT_RULE_LABEL
+                    || new.get(label).is_some_and(|&(fp, unnamed)| {
+                        !unnamed || old.get(label).is_none_or(|&(old_fp, _)| old_fp == fp)
+                    })
+            },
+            |profile| router.profile(profile).is_some() || registry.get(profile).is_some(),
+        );
+        self.counters = previous.counters.clone();
+        self
+    }
+
     /// Live traffic counters of this snapshot.
     pub fn counters(&self) -> &RoutingCounters {
         &self.counters
@@ -1325,6 +1355,99 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn state(text: &str) -> RoutingState {
+        RoutingState::from_input(&test_support::input(text), DialerOptions::default()).unwrap()
+    }
+
+    const PROFILES: &str = "[profiles.a]\ntype = \"http\"\nhost = \"h\"\nport = 1\n\n[profiles.b]\ntype = \"http\"\nhost = \"h\"\nport = 2\n\n";
+
+    fn rules(rules: &[(&str, &str, &str)]) -> String {
+        let mut text = PROFILES.to_string();
+        for (name, host, target) in rules {
+            text.push_str("[[routing.rules]]\n");
+            if !name.is_empty() {
+                text.push_str(&format!("name = \"{name}\"\n"));
+            }
+            text.push_str(&format!("host = \"{host}\"\ntarget = \"{target}\"\n\n"));
+        }
+        text
+    }
+
+    #[test]
+    fn with_counters_from_keeps_what_still_exists_and_resets_moved_unnamed_rules() {
+        let before = state(&rules(&[
+            ("named", "n.example", "a"),
+            ("", "x.example", "a"),
+            ("", "y.example", "b"),
+        ]));
+        for (rule, profile) in [
+            ("named", "a"),
+            ("[routing] rule #2", "a"),
+            ("[routing] rule #3", "b"),
+            (crate::router::DEFAULT_RULE_LABEL, "direct"),
+        ] {
+            drop(before.counters.track(rule, profile));
+        }
+
+        // Nothing changed: every counter survives.
+        let same = state(&rules(&[
+            ("named", "n.example", "a"),
+            ("", "x.example", "a"),
+            ("", "y.example", "b"),
+        ]))
+        .with_counters_from(&before);
+        assert_eq!(
+            same.counters, before.counters,
+            "the counters are shared, not copied"
+        );
+        for label in [
+            "named",
+            "[routing] rule #2",
+            "[routing] rule #3",
+            crate::router::DEFAULT_RULE_LABEL,
+        ] {
+            assert!(
+                same.counters.rule(label).is_some(),
+                "{label} must survive an unchanged reload"
+            );
+        }
+        assert!(same.counters.profile("a").is_some() && same.counters.profile("b").is_some());
+
+        // Profile `b` and rule #3 removed; a new rule inserted at #2 moves `x.example` to #3.
+        let text = rules(&[
+            ("named", "n.example", "a"),
+            ("", "new.example", "a"),
+            ("", "x.example", "a"),
+        ])
+        .replace(
+            "[profiles.b]\ntype = \"http\"\nhost = \"h\"\nport = 2\n\n",
+            "",
+        );
+        let after = state(&text).with_counters_from(&same);
+        assert!(
+            after.counters.rule("named").is_some(),
+            "named rules keep their counters"
+        );
+        assert!(after
+            .counters
+            .rule(crate::router::DEFAULT_RULE_LABEL)
+            .is_some());
+        assert!(
+            after.counters.rule("[routing] rule #2").is_none(),
+            "#2 now holds another rule"
+        );
+        assert!(
+            after.counters.rule("[routing] rule #3").is_none(),
+            "#3 now holds another rule"
+        );
+        assert!(after.counters.profile("a").is_some());
+        assert!(after.counters.profile("b").is_none(), "removed profile");
+        assert!(
+            after.counters.profile("direct").is_some(),
+            "built-ins are always known"
+        );
+    }
 
     #[test]
     fn inbound_parses_and_displays() {

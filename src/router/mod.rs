@@ -20,11 +20,11 @@
 pub mod condition;
 pub mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::filter::{AccessDenied, HostFilter};
+use crate::filter::{AccessDenied, CompiledFilter};
 use crate::routing::{
     Inbound, ProfileConfig, ProfileType, RoutingInput, RuleConfig, Target, PROFILE_DIRECT,
 };
@@ -171,14 +171,158 @@ impl Resolver for SliceResolver<'_> {
 #[derive(Debug, Clone)]
 struct CompiledRule {
     label: String,
+    /// `false` for a rule without `name` (labelled by position, `<table> rule #N`).
+    named: bool,
+    /// Hash of the rule as written, to tell whether an unnamed rule's position now holds a
+    /// different rule after a reload.
+    fingerprint: u64,
     matcher: RuleMatcher,
     target: Vec<String>,
     bypass_mitm: bool,
 }
 
+/// Stable within one process: the default `SipHash` keys are fixed.
+fn rule_fingerprint(rule: &RuleConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(rule).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// A run of consecutive host-only rules (see `RuleMatcher::host_only`), indexed by host key
+/// with the lowest rule index per key so the first match keeps rule order.
+#[derive(Debug, Clone, Default)]
+struct HostRun {
+    /// Rule index range `start..end` in the table.
+    start: usize,
+    end: usize,
+    exact: HashMap<String, usize>,
+    apex_and_subdomains: HashMap<String, usize>,
+    subdomains: HashMap<String, usize>,
+    /// Lowest index of a rule with a `*` pattern.
+    any: Option<usize>,
+    /// Rules (ascending) whose residual patterns need their own matcher.
+    residual: Vec<usize>,
+}
+
+impl HostRun {
+    fn add(&mut self, index: usize, keys: &condition::HostOnly<'_>) {
+        self.end = index + 1;
+        let condition::HostOnly::Keys {
+            exact,
+            apex_and_subdomains,
+            subdomains,
+            any,
+            residual,
+        } = keys
+        else {
+            return;
+        };
+        let keep = |map: &mut HashMap<String, usize>, key: &str| {
+            map.entry(key.to_string()).or_insert(index);
+        };
+        for k in exact {
+            keep(&mut self.exact, k);
+        }
+        for k in apex_and_subdomains {
+            keep(&mut self.apex_and_subdomains, k);
+        }
+        for k in subdomains {
+            keep(&mut self.subdomains, k);
+        }
+        if *any && self.any.is_none() {
+            self.any = Some(index);
+        }
+        if *residual {
+            self.residual.push(index);
+        }
+    }
+
+    /// Lowest index of a rule in this run that matches, for a lowercase ASCII host.
+    fn first_match(&self, rules: &[CompiledRule], ctx: &MatchContext<'_>) -> Option<usize> {
+        let host = ctx.host;
+        let mut best = self.any;
+        let mut consider = |hit: Option<&usize>| {
+            if let Some(&i) = hit {
+                best = Some(best.map_or(i, |b| b.min(i)));
+            }
+        };
+        consider(self.exact.get(host));
+        consider(self.apex_and_subdomains.get(host));
+        if !self.apex_and_subdomains.is_empty() || !self.subdomains.is_empty() {
+            for (i, b) in host.bytes().enumerate() {
+                if b == b'.' {
+                    let suffix = &host[i + 1..];
+                    consider(self.apex_and_subdomains.get(suffix));
+                    consider(self.subdomains.get(suffix));
+                }
+            }
+        }
+        for &i in &self.residual {
+            if best.is_some_and(|b| b <= i) {
+                break;
+            }
+            if rules[i].matcher.matches(ctx) {
+                return Some(i);
+            }
+        }
+        best
+    }
+}
+
+/// A table split into indexed host-only runs and rules evaluated one by one.
+#[derive(Debug, Clone)]
+enum Segment {
+    Run(HostRun),
+    /// Rules `start..end`, evaluated one by one.
+    Linear(usize, usize),
+}
+
+/// Host-only runs shorter than this are scanned (the index costs more than it saves).
+const MIN_INDEXED_RUN: usize = 8;
+
+fn segments(rules: &[CompiledRule]) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    let mut run: Option<HostRun> = None;
+    // Append `start..end` to a trailing linear segment, or start one.
+    fn linear(out: &mut Vec<Segment>, start: usize, end: usize) {
+        match out.last_mut() {
+            Some(Segment::Linear(_, e)) if *e == start => *e = end,
+            _ => out.push(Segment::Linear(start, end)),
+        }
+    }
+    let flush = |run: &mut Option<HostRun>, out: &mut Vec<Segment>| {
+        if let Some(r) = run.take() {
+            if r.end - r.start >= MIN_INDEXED_RUN {
+                out.push(Segment::Run(r));
+            } else {
+                linear(out, r.start, r.end);
+            }
+        }
+    };
+    for (i, rule) in rules.iter().enumerate() {
+        match rule.matcher.host_only() {
+            Some(keys) => run
+                .get_or_insert_with(|| HostRun {
+                    start: i,
+                    end: i,
+                    ..HostRun::default()
+                })
+                .add(i, &keys),
+            None => {
+                flush(&mut run, &mut out);
+                linear(&mut out, i, i + 1);
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
+}
+
 #[derive(Debug, Clone)]
 struct Table {
     kind: TableKind,
+    segments: Vec<Segment>,
     rules: Vec<CompiledRule>,
     default: Option<Vec<String>>,
     inherit: bool,
@@ -209,6 +353,8 @@ impl Table {
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("{table} rule #{}", i + 1)),
+                named: r.name.is_some(),
+                fingerprint: rule_fingerprint(r),
                 matcher,
                 target: r.target.as_slice().to_vec(),
                 bypass_mitm: r.bypass_mitm,
@@ -216,6 +362,7 @@ impl Table {
             .collect();
         Ok(Self {
             kind,
+            segments: segments(&rules),
             has_url_rules: rules.iter().any(|r| r.matcher.has_url_conditions()),
             has_dns_rules: rules.iter().any(|r| r.matcher.needs_dns()),
             rules,
@@ -224,7 +371,32 @@ impl Table {
         })
     }
 
+    /// The first rule that matches, in rule order. Indexed runs answer ASCII hosts from
+    /// their maps; any other host scans the run, so results equal [`Self::first_match_linear`].
     fn first_match(&self, ctx: &MatchContext<'_>) -> Option<(usize, &CompiledRule)> {
+        let indexable = ctx.host.is_ascii() && !ctx.host.bytes().any(|b| b.is_ascii_uppercase());
+        for segment in &self.segments {
+            let scan = |start: usize, end: usize| {
+                self.rules[start..end]
+                    .iter()
+                    .position(|r| r.matcher.matches(ctx))
+                    .map(|p| start + p)
+            };
+            let hit = match segment {
+                Segment::Linear(start, end) => scan(*start, *end),
+                Segment::Run(run) if indexable => run.first_match(&self.rules, ctx),
+                Segment::Run(run) => scan(run.start, run.end),
+            };
+            if let Some(i) = hit {
+                return Some((i, &self.rules[i]));
+            }
+        }
+        None
+    }
+
+    /// The reference: every rule in order.
+    #[cfg(all(test, feature = "routing"))]
+    fn first_match_linear(&self, ctx: &MatchContext<'_>) -> Option<(usize, &CompiledRule)> {
         self.rules
             .iter()
             .enumerate()
@@ -240,7 +412,7 @@ pub struct Router {
     socks: Option<Table>,
     profiles: BTreeMap<String, ProfileConfig>,
     bypass: BTreeMap<String, BypassList>,
-    filter: Option<HostFilter>,
+    filter: Option<CompiledFilter>,
     notices: Vec<String>,
 }
 
@@ -285,7 +457,7 @@ impl Router {
             socks,
             profiles: cfg.profiles_with_builtins(),
             bypass,
-            filter: cfg.filter.clone(),
+            filter: cfg.filter.clone().map(CompiledFilter::new),
             notices: validate::url_rule_notices(r, cfg.mitm_enabled),
         })
     }
@@ -298,6 +470,16 @@ impl Router {
     /// A profile by name (built-ins included).
     pub fn profile(&self, name: &str) -> Option<&ProfileConfig> {
         self.profiles.get(name)
+    }
+
+    /// Every rule label with its fingerprint and whether it is unnamed (positional).
+    pub(crate) fn rule_labels(&self) -> HashMap<&str, (u64, bool)> {
+        [Some(&self.unified), self.http.as_ref(), self.socks.as_ref()]
+            .into_iter()
+            .flatten()
+            .flat_map(|t| &t.rules)
+            .map(|r| (r.label.as_str(), (r.fingerprint, !r.named)))
+            .collect()
     }
 
     /// Number of profiles, built-ins included.
@@ -380,7 +562,7 @@ impl Router {
         clock: &dyn Clock,
         resolver: &dyn Resolver,
     ) -> Result<RouteDecision, AccessDenied> {
-        let host = normalize_host(req.host);
+        let host = condition::normalize_host_cow(req.host);
         if let Some(f) = &self.filter {
             f.check_host(&host)?;
         }
@@ -406,21 +588,24 @@ impl Router {
         ) -> Option<(TableKind, usize, &'t CompiledRule)> {
             t.first_match(ctx).map(|(i, r)| (t.kind, i, r))
         }
-        let (table, matched, default) = match self.split_for(req.inbound) {
+        static DIRECT: &[String] = &[];
+        // Defaults are borrowed and only looked at when no rule matched.
+        let (table, matched, default): (TableKind, _, &[String]) = match self.split_for(req.inbound)
+        {
             Some(t) => {
                 let matched =
                     hit(t, &ctx).or_else(|| t.inherit.then(|| hit(&self.unified, &ctx)).flatten());
                 let default = match (&t.default, t.inherit) {
-                    (Some(d), _) => d.clone(),
-                    (None, true) => self.unified.default.clone().unwrap_or_default(),
-                    (None, false) => vec![PROFILE_DIRECT.to_string()],
+                    (Some(d), _) => d.as_slice(),
+                    (None, true) => self.unified.default.as_deref().unwrap_or(DIRECT),
+                    (None, false) => DIRECT,
                 };
                 (t.kind, matched, default)
             }
             None => (
                 TableKind::Unified,
                 hit(&self.unified, &ctx),
-                self.unified.default.clone().unwrap_or_default(),
+                self.unified.default.as_deref().unwrap_or(DIRECT),
             ),
         };
 
@@ -429,21 +614,22 @@ impl Router {
                 kind,
                 Some(r.label.clone()),
                 Some(i),
-                r.target.clone(),
+                r.target.as_slice(),
                 r.bypass_mitm,
             ),
             None => (table, None, None, default, false),
         };
-        let names = if names.is_empty() {
-            vec![PROFILE_DIRECT.to_string()]
+        // An empty chain (no default anywhere) routes `direct`.
+        let targets = if names.is_empty() {
+            vec![self.resolve_target(PROFILE_DIRECT, &ctx)]
         } else {
-            names
+            names.iter().map(|n| self.resolve_target(n, &ctx)).collect()
         };
         Ok(RouteDecision {
             table,
             rule,
             rule_index,
-            targets: names.iter().map(|n| self.resolve_target(n, &ctx)).collect(),
+            targets,
             has_url_rules,
             bypass_mitm,
         })
@@ -587,6 +773,86 @@ mod tests {
         weekday: 0,
         minute_of_day: 720,
     });
+
+    /// Generated tables: indexed `first_match` must equal the linear reference.
+    #[cfg(feature = "routing")]
+    #[test]
+    fn indexed_first_match_equals_linear_scan() {
+        let next = |state: &mut u64| {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *state >> 33
+        };
+        let labels = ["a", "b", "corp", "ex", "lan", "dev-1", "x"];
+        for seed in [1u64, 2, 3] {
+            let mut state = seed;
+            let name = |state: &mut u64| -> String {
+                let n = 1 + next(state) % 3;
+                (0..n)
+                    .map(|_| labels[(next(state) % labels.len() as u64) as usize])
+                    .collect::<Vec<_>>()
+                    .join(".")
+            };
+            let mut text =
+                String::from("[profiles.p]\ntype = \"http\"\nhost = \"h\"\nport = 1\n\n");
+            for i in 0..1200u64 {
+                let n = name(&mut state);
+                let body = match next(&mut state) % 14 {
+                    0..=3 => format!("host = \"{n}\""),
+                    4..=6 => format!("host_wildcard = \"*.{n}\""),
+                    7 => format!("host_wildcard = \"**.{n}\""),
+                    8 => format!("host_wildcard = [\"{n}\", \"dev-*.{n}\"]"),
+                    9 => format!("host = \"{n}\"\ndisabled = true"),
+                    10 if i % 97 == 0 => "host_wildcard = \"*\"".to_string(),
+                    10 => format!("host_wildcard = \"h?st.{n}\""),
+                    11 if i % 151 == 0 => "match_all = true".to_string(),
+                    11 => format!("host = \"{n}\"\nport = 443"),
+                    12 => format!("host_regex = \"^{n}$\""),
+                    _ => format!("host = [\"{n}\", \"z.{n}\", \"y.{n}\"]"),
+                };
+                text.push_str(&format!("[[routing.rules]]\n{body}\ntarget = \"p\"\n\n"));
+            }
+            let r = router(&text);
+            assert!(
+                r.unified
+                    .segments
+                    .iter()
+                    .any(|s| matches!(s, Segment::Run(_))),
+                "the generated table must contain indexed runs"
+            );
+            let mut hosts: Vec<String> = (0..3000).map(|_| name(&mut state)).collect();
+            hosts.extend(
+                [
+                    "host.lan",
+                    "hast.corp",
+                    "dev-1.a",
+                    "k.\u{212a}.lan",
+                    "",
+                    "q",
+                ]
+                .map(String::from),
+            );
+            for host in &hosts {
+                for port in [80u16, 443] {
+                    let ctx = MatchContext::new(
+                        Inbound::Http,
+                        host,
+                        port,
+                        None,
+                        None,
+                        &NOON,
+                        &SliceResolver(&[]),
+                    );
+                    assert_eq!(
+                        r.unified.first_match(&ctx).map(|(i, _)| i),
+                        r.unified.first_match_linear(&ctx).map(|(i, _)| i),
+                        "seed {seed} host {host:?} port {port}"
+                    );
+                }
+            }
+        }
+    }
 
     fn route(r: &Router, inbound: Inbound, host: &str, port: u16) -> RouteDecision {
         r.route_with(

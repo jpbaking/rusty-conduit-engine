@@ -1,47 +1,50 @@
-# phase-0004 — cli-support: shared [mitm] and [logging] file sections
+# phase-0004 — Hot-path allocation, clock, and counter lookups
 
 - Status: done
 - Owner: planner
 - Depends on: phase-0003
-- Goal: Provide `cli_support::file` with the `[mitm]` and `[logging]` config-file section structs and the merge helpers the three CLIs duplicate, so Phase 3b can delete their copies.
-- Done when: every command in `## Verify` exits 0, and unit tests cover each CLI's precedence rules (CLI > file > default) for every field, including switch's deprecated `mitm.cert_cache_max` key.
-- Pattern to follow: `../rusty-conduit/src/config.rs:371-398` (`FileMitmConfig`, `FileLoggingConfig`), `../rusty-conduit/src/config.rs:554-663` (`merge`), `../rusty-conduit-switch/src/config.rs:594-622` (switch's variant with `cert_cache_max`)
+- Goal: Cut per-request work in routing: normalize the host once without allocating when it is already normal, stop cloning default/target lists before a match is known, cache the local time per minute, and give compiled rules and profiles their counters up front instead of two `DashMap` lookups per request.
+- Done when: every command in `## Verify` exits 0; route and counter tests pass unchanged; the benchmark's miss-heavy and url cases do not regress.
+- Pattern to follow: `src/router/mod.rs` `Router::route_with`, `src/router/condition.rs` `LocalTime::now` / `normalize_host`, `src/routing.rs` `RoutingCounters::track`
 
 ## Context
-M-01: the three CLIs repeat the `[mitm]` / `[logging]` structs and their merge logic (rusty-conduit and ssh identical; switch adds the deprecated `cert_cache_max` key with precedence CLI `_entries` > file `cert_cache_max_entries` > file `cert_cache_max` plus a NOTICE). `deny_unknown_fields` cannot be combined with `serde(flatten)`, so the shared types are named-table structs the CLIs embed as `mitm: Option<FileMitmConfig>` / `logging: Option<FileLoggingConfig>`; top-level keepalive and allow/block keys stay in each CLI. Design (field set, helper signatures, how deprecation notices surface) is decided while running this phase and recorded in `## Log`. serde only; no `toml` or `clap`.
+P-09 part 3. `route_with` allocates the normalized host and clones `default` per request; `LocalTime::now()` calls `now_local()` (glibc `localtime_r` takes a global lock) whenever a time rule is evaluated; `RoutingCounters::track(rule, profile)` does two `DashMap` lookups per request. Decisions: `normalize_host` returns `Cow<str>`; defaults are borrowed until a decision is built; a process-wide `AtomicU64` caches `(unix_minute, weekday, minute_of_day)` for `SystemClock` (injected clocks are untouched); counters are pre-resolved per `RoutingState` (rule label / profile name → `Arc<TrafficCounters>`) with `track` falling back to the map for names not in the snapshot. Public signatures stay; `PinnedRouting` by value is out (see GOAL Log).
 
 ## Scope
-- In: `src/cli_support/mod.rs`, `src/cli_support/file.rs` (new), `DOX.md` (Feature Map line for cli-support)
-- Out: `Cargo.toml`, `Cargo.lock`, `src/routing.rs`, `src/mitm/` (consume its public types only), the consumer repos
+- In: `src/router/mod.rs`, `src/router/condition.rs`, `src/routing.rs`, `src/http/` and `src/socks/` (only call sites of the counter API)
+- Out: `src/filter.rs`, `Cargo.toml`, `Cargo.lock`, public trait signatures
 
 ## Sub-tasks
-1. [done] `FileMitmConfig` (incl. a deprecated `cert_cache_max: Option<usize>` alongside `cert_cache_max_entries`) and `FileLoggingConfig`, `Deserialize` + `deny_unknown_fields`, with `file_duration(key, value)` — done when: unit tests parse each CLI's documented `[mitm]` / `[logging]` example and reject an unknown key.
-2. [done] Merge helpers producing the MITM settings (CA source, passphrase source, TTL, cache size with the deprecated-key precedence and notice, insecure/bypass host lists, insecure flag) and logging settings from CLI-side values plus the file section — done when: precedence tests pass for every field.
-3. [done] DOX Feature Map entry for `cli-support` (Start: `src/cli_support/mod.rs`) — done when: `grep -c 'cli_support' DOX.md` prints at least `1`.
+1. [done] `Cow` host normalization and no pre-match clones — done when: router tests pass.
+2. [done] Minute-cached `SystemClock` — done when: a test shows two calls in the same minute do not re-query (via a test hook) and time-rule tests pass.
+3. [skipped — reason: a counter lookup is two sharded `DashMap` reads (tens of nanoseconds, under 0.1% of a proxied request); pre-attaching needs either a new `Arc` field in the public `RouteDecision` or a second per-state cache that phase-0005's reload pruning must keep coherent — not worth the API and coherence cost] Pre-resolved counters — done when: `tests/traffic_counters.rs` and counter unit tests pass unchanged.
 
 ## Verify
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --no-default-features --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked
+cargo test --no-default-features --locked
 cargo test --all-features --locked
-cargo test --no-default-features --features cli-support --locked
-git diff --exit-code -- Cargo.toml Cargo.lock src/routing.rs src/mitm
+cargo run --release --example route_bench --locked
+git diff --exit-code -- src/filter.rs Cargo.toml Cargo.lock
 ```
 
 ## Escalate when
-- The three CLIs' merge semantics cannot be expressed by one helper without changing one CLI's behavior → record the difference as a divergence-ledger candidate in `## Log` and keep each behavior selectable.
+- Pre-resolving counters would change which label a request is counted under → stop; counters are user-visible.
 
 ## Log
 - (append-only, one line per event)
 - planner begins phase-0004 (planner-owned)
-- design: `cli_support::file` — `FileMitmConfig` (incl. deprecated `cert_cache_max`), `FileLoggingConfig`, `file_duration`, `FileValueError { key, message }` (Display identical to the CLIs' `ConfigError::InvalidFileValue`), `MitmCliValues` → `merge_mitm` → `MitmSettings { …, notices }`, `LoggingCliValues` → `merge_logging` → `LoggingSettings`; defaults are the engine's `DEFAULT_MITM_CERT_TTL` / `DEFAULT_MITM_CERT_CACHE_MAX` (= the CLIs' values after M-16) and INFO / text
-- design: `cert_cache_max` precedence CLI `_entries` > file `_entries` > file `cert_cache_max`, and the notice (switch's exact text, `DEPRECATED_CERT_CACHE_MAX_NOTICE`) is emitted whenever the deprecated key is present, as switch does; rusty-conduit and ssh never had the key, so for them it is only a newly accepted spelling
-- divergence candidate for phase-0007's ledger entry: the CLIs' `FileMitmConfig` derived `Debug` (printing `ca_passphrase`); the engine's `FileMitmConfig`, `MitmCliValues`, and `MitmSettings` redact it (engine contract)
-- divergence candidate: rusty-conduit and ssh did not accept `mitm.cert_cache_max`; the shared section does (with switch's notice)
+- sub-task 1: `normalize_host_cow` (borrows when already normal; public `normalize_host` unchanged); `route_with` borrows table defaults and the matched rule's target list instead of cloning them before the match is known (an empty chain still resolves `direct`)
+- sub-task 2: `SystemClock::now` memoizes the local time per unix minute in one `AtomicU64` (exact: local time only changes on minute boundaries; injected clocks untouched); documented in DOX in phase-0005 as a clock memo, not a data cache
+- sub-task 3 skipped (see sub-task line)
 - phase-0004 verified and closed
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test --all-features --locked cli_support::file` → 8 passed (sections parse / reject unknown keys, defaults, file fill-in, CLI wins every field, deprecated-key precedence + notice, error keys and text, logging precedence, Debug redaction)
-- `cargo clippy --all-targets --all-features` and `--no-default-features` → exit 0; `cargo test --all-features --locked` → 242 passed; `--no-default-features --features cli-support` → 230 passed; `git diff --exit-code -- Cargo.toml Cargo.lock src/routing.rs src/mitm` → exit 0; `grep -c 'cli_support' DOX.md` → 3
+- new tests `system_clock_queries_the_local_time_once_per_minute`, `normalize_host_cow_matches_normalize_host` → pass
+- clippy default / --no-default-features / --all-features → exit 0; tests 231 / 216 / 271 passed; `tests/traffic_counters.rs` → passed unchanged
+- bench (two runs): N=5000 host 75 ns (phase-0003: 100 ns), wildcard 85–87 ns (110–127 ns); mixed 36 µs and url 50–57 µs within run-to-run noise of earlier runs (url baseline 44–51 µs, phase-0003 51–54 µs)

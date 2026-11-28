@@ -9,3 +9,4 @@
   - Optionally rename the `blocked_web_in_mitm` SOCKS access-log status (`web_guard::BLOCKED_STATUS`)
     to `blocked_web` since SOCKS web blocking is now standalone; breaking for log parsers, so
     pair with the next major CLI release (`v3.0.0`).
+- **Routing follow-ups from P-09.** Direct dials still check the destination filter's domain lists by scanning (`src/net.rs`); give `DialerOptions` a `CompiledFilter`. `PinnedRouting` by value would save one allocation per request but changes the public `RouteResolver::pin` signature. URL rules (`url_wildcard` / `url_regex`) and mixed-kind rule lists are still evaluated rule by rule.
