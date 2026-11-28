@@ -2,6 +2,11 @@
 
 The shared proxy and routing engine behind the rusty-conduit CLI family.
 
+> [!IMPORTANT]
+> **For development, testing, labs, and homelabs.** These tools are well tested and built
+> with care, but nothing here is promised to be production-ready, and the proxies have **no
+> inbound authentication**. Keep them on loopback or a private network you control.
+
 ## Purpose
 
 `rusty-conduit-engine` is a library-only Rust crate (`rusty_conduit_engine`) that holds the
