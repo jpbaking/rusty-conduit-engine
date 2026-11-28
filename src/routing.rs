@@ -175,6 +175,10 @@ pub struct RuleConfig {
     pub disabled: bool,
     /// Per-rule override of `[routing].resolve_dns`.
     pub resolve_dns: Option<bool>,
+    /// Skip HTTPS MITM interception when this rule matches a `CONNECT` request (opaque tunnel
+    /// instead). Off by default.
+    #[serde(default)]
+    pub bypass_mitm: bool,
     pub target: Target,
 }
 

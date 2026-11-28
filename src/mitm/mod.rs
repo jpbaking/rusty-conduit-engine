@@ -71,6 +71,9 @@ pub struct MitmOptions {
     pub cert_cache_max: usize,
     /// How upstream server certificates are verified (default: strict).
     pub upstream_tls: UpstreamTlsVerification,
+    /// Destinations (`FilterRule`: exact domain, `*.domain`, IP, or CIDR) that bypass HTTPS
+    /// MITM interception and use an opaque `CONNECT` tunnel instead.
+    pub bypass_hosts: Vec<FilterRule>,
 }
 
 impl Default for MitmOptions {
@@ -82,6 +85,7 @@ impl Default for MitmOptions {
             cert_ttl: DEFAULT_MITM_CERT_TTL,
             cert_cache_max: DEFAULT_MITM_CERT_CACHE_MAX,
             upstream_tls: UpstreamTlsVerification::Strict,
+            bypass_hosts: Vec::new(),
         }
     }
 }
@@ -98,6 +102,7 @@ impl fmt::Debug for MitmOptions {
             .field("cert_ttl", &self.cert_ttl)
             .field("cert_cache_max", &self.cert_cache_max)
             .field("upstream_tls", &self.upstream_tls)
+            .field("bypass_hosts", &self.bypass_hosts)
             .finish()
     }
 }
@@ -222,7 +227,8 @@ impl MitmState {
         let cache = Arc::new(
             CertCache::new(Arc::new(signer), cfg.cert_ttl).with_max_entries(cfg.cert_cache_max),
         );
-        let interceptor = MitmInterceptor::new(Arc::clone(&cache), Arc::new(upstream), provider);
+        let interceptor = MitmInterceptor::new(Arc::clone(&cache), Arc::new(upstream), provider)
+            .with_bypass_hosts(cfg.bypass_hosts.clone());
         Ok(Self {
             interceptor,
             cache,

@@ -256,14 +256,16 @@ impl RequestCtx {
             return forward::handle(self, req).await;
         }
         match self.proxy.mitm.clone() {
-            Some(mitm) => self.mitm_connect(mitm, req),
+            Some(mitm) => self.mitm_connect(mitm, req).await,
             None => tunnel::handle(self, req).await,
         }
     }
 
-    /// Answer a MITM `CONNECT` with `200` and intercept the upgraded stream. Invalid targets
-    /// get `400` and filter-denied destinations `403` before the tunnel is established.
-    fn mitm_connect(
+    /// Answer a MITM `CONNECT` with `200` and intercept the upgraded stream, unless the matched
+    /// rule requested [`RouteDecision::bypass_mitm`] (in which case an opaque tunnel is used).
+    /// Invalid targets get `400` and filter-denied destinations `403` before the tunnel is
+    /// established.
+    async fn mitm_connect(
         &self,
         mitm: Arc<MitmInterceptor>,
         req: Request<Incoming>,
@@ -289,18 +291,24 @@ impl RequestCtx {
             scheme: Some("https"),
             url: None,
         };
-        if let Err(denied) = route.resolve(&route_req) {
-            let mut guard = self.access_guard("https", true, "CONNECT", target.authority());
-            guard.set_status(StatusCode::FORBIDDEN);
-            self.proxy.logger.info(format!(
-                "CONNECT {target} from {} denied by filter: {denied}",
-                self.peer
-            ));
-            return self.error(
-                StatusCode::FORBIDDEN,
-                "destination not allowed",
-                Some(&target.authority()),
-            );
+        let decision = match route.resolve(&route_req) {
+            Ok(d) => d,
+            Err(denied) => {
+                let mut guard = self.access_guard("https", true, "CONNECT", target.authority());
+                guard.set_status(StatusCode::FORBIDDEN);
+                self.proxy.logger.info(format!(
+                    "CONNECT {target} from {} denied by filter: {denied}",
+                    self.peer
+                ));
+                return self.error(
+                    StatusCode::FORBIDDEN,
+                    "destination not allowed",
+                    Some(&target.authority()),
+                );
+            }
+        };
+        if decision.bypass_mitm || mitm.should_bypass(&target.host) {
+            return tunnel::handle_resolved(self, req, target, decision).await;
         }
         let (client, shutdown) = (self.peer, self.shutdown.clone());
         let (access, logger) = (self.proxy.access.clone(), self.proxy.logger.clone());

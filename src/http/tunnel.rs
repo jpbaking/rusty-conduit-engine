@@ -24,7 +24,7 @@ use super::{
     connect_established, dial_error_status, failed_route, ConnectTarget, ProxyBody, RequestCtx,
 };
 use crate::net::relay_bidirectional;
-use crate::router::RouteRequest;
+use crate::router::{RouteDecision, RouteRequest};
 use crate::routing::{Inbound, RoutingState};
 
 /// Handle a `CONNECT` request without interception.
@@ -34,10 +34,10 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         .authority()
         .map(|a| a.as_str().to_string())
         .unwrap_or_default();
-    let mut guard = ctx.access_guard("https", false, "CONNECT", authority.clone());
     let logger = ctx.proxy.logger.clone();
 
     let Some(target) = ConnectTarget::parse(&authority) else {
+        let mut guard = ctx.access_guard("https", false, "CONNECT", authority.clone());
         guard.set_status(StatusCode::BAD_REQUEST);
         logger.debug(format!(
             "rejected CONNECT from {}: invalid target {authority:?}",
@@ -51,8 +51,6 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
     };
 
     let page = target.authority();
-    let page = Some(page.as_str());
-    let state = Arc::clone(&ctx.state);
     let route_req = RouteRequest {
         inbound: Inbound::Http,
         host: &target.host,
@@ -63,14 +61,35 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
     let decision = match ctx.route.resolve(&route_req) {
         Ok(d) => d,
         Err(denied) => {
+            let mut guard = ctx.access_guard("https", false, "CONNECT", authority);
             guard.set_status(StatusCode::FORBIDDEN);
             logger.info(format!(
                 "CONNECT {target} from {} denied by filter: {denied}",
                 ctx.peer
             ));
-            return ctx.error(StatusCode::FORBIDDEN, "destination not allowed", page);
+            return ctx.error(
+                StatusCode::FORBIDDEN,
+                "destination not allowed",
+                Some(page.as_str()),
+            );
         }
     };
+    handle_resolved(ctx, req, target, decision).await
+}
+
+/// Handle a `CONNECT` request without interception using an already-parsed target and routing
+/// decision (shared by plain `CONNECT` and MITM-bypassed rules).
+pub(crate) async fn handle_resolved(
+    ctx: &RequestCtx,
+    req: Request<Incoming>,
+    target: ConnectTarget,
+    decision: RouteDecision,
+) -> Response<ProxyBody> {
+    let authority = target.authority();
+    let mut guard = ctx.access_guard("https", false, "CONNECT", authority.clone());
+    let logger = ctx.proxy.logger.clone();
+    let page = Some(authority.as_str());
+    let state = Arc::clone(&ctx.state);
     let rule = decision.rule_label().to_string();
     let chain = match state.registry.chain_for(&decision.targets) {
         Ok(c) => c.with_logger(logger.clone()),

@@ -127,6 +127,8 @@ pub struct RouteDecision {
     /// The table(s) consulted for this inbound protocol contain URL rules, so a MITM tunnel
     /// must re-route each decrypted request.
     pub has_url_rules: bool,
+    /// Matched rule requested bypassing HTTPS MITM interception (opaque `CONNECT` tunnel).
+    pub bypass_mitm: bool,
 }
 
 impl RouteDecision {
@@ -158,6 +160,7 @@ struct CompiledRule {
     label: String,
     matcher: RuleMatcher,
     target: Vec<String>,
+    bypass_mitm: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +197,7 @@ impl Table {
                     .unwrap_or_else(|| format!("{table} rule #{}", i + 1)),
                 matcher,
                 target: r.target.as_slice().to_vec(),
+                bypass_mitm: r.bypass_mitm,
             })
             .collect();
         Ok(Self {
@@ -364,9 +368,15 @@ impl Router {
             ),
         };
 
-        let (table, rule, rule_index, names) = match matched {
-            Some((kind, i, r)) => (kind, Some(r.label.clone()), Some(i), r.target.clone()),
-            None => (table, None, None, default),
+        let (table, rule, rule_index, names, bypass_mitm) = match matched {
+            Some((kind, i, r)) => (
+                kind,
+                Some(r.label.clone()),
+                Some(i),
+                r.target.clone(),
+                r.bypass_mitm,
+            ),
+            None => (table, None, None, default, false),
         };
         let names = if names.is_empty() {
             vec![PROFILE_DIRECT.to_string()]
@@ -379,6 +389,7 @@ impl Router {
             rule_index,
             targets: names.iter().map(|n| self.resolve_target(n, &ctx)).collect(),
             has_url_rules,
+            bypass_mitm,
         })
     }
 

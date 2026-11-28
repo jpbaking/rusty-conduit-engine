@@ -8,6 +8,7 @@ Owns code under `src/http/`. CA loading, leaf signing, and the leaf-certificate 
 
 ## Local Contracts
 - `CONNECT host:port` is routed with `scheme = "https"` and no URL. Any other method is routed with `scheme = "http"` and the full URL.
+- When MITM is enabled and a `CONNECT` matches either `MitmOptions::bypass_hosts` (`MitmInterceptor::should_bypass`) or a rule with `RuleConfig::bypass_mitm` (`RouteDecision::bypass_mitm == true`), dispatch hands the resolved target to the opaque `CONNECT` tunnel (`tunnel::handle_resolved`, `mitm=false`) instead of intercepting TLS.
 - Forwarding to an `http`/`https` upstream proxy sends the request in absolute-form to the proxy itself, with `Proxy-Authorization` when configured — never `CONNECT host:80`. `direct`, `socks5`, and `socks4a` upstreams get origin-form over a dialed tunnel.
 - Hop-by-hop headers are stripped before forwarding, except `te: trailers` on decrypted HTTP/2 (the one `TE` value HTTP/2 allows). Bodies are streamed, never cached.
 - A `block` route or filter denial answers `403 Forbidden`. Dial errors map to HTTP status codes through `dial_error_to_status`.

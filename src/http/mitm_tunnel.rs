@@ -331,6 +331,7 @@ pub struct MitmInterceptor {
     upstream_tls: Arc<ClientConfig>,
     provider: Arc<CryptoProvider>,
     error_page: Option<ErrorPageTemplate>,
+    bypass_hosts: Arc<[FilterRule]>,
 }
 
 impl fmt::Debug for MitmInterceptor {
@@ -338,6 +339,7 @@ impl fmt::Debug for MitmInterceptor {
         f.debug_struct("MitmInterceptor")
             .field("cache", &self.cache)
             .field("error_page", &self.error_page)
+            .field("bypass_hosts", &self.bypass_hosts.len())
             .finish_non_exhaustive()
     }
 }
@@ -603,6 +605,31 @@ impl MitmInterceptor {
             upstream_tls,
             provider,
             error_page: None,
+            bypass_hosts: Arc::from([]),
+        }
+    }
+
+    /// Skip MITM interception (use an opaque `CONNECT` tunnel instead) for destinations
+    /// matching any rule in `hosts`.
+    pub fn with_bypass_hosts(mut self, hosts: Vec<FilterRule>) -> Self {
+        self.bypass_hosts = Arc::from(hosts);
+        self
+    }
+
+    /// Whether `host` (a hostname or IP literal without brackets) matches any configured
+    /// MITM bypass rule.
+    pub fn should_bypass(&self, host: &str) -> bool {
+        if self.bypass_hosts.is_empty() {
+            return false;
+        }
+        let trimmed = host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(host);
+        if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+            self.bypass_hosts.iter().any(|r| r.matches_ip(ip))
+        } else {
+            self.bypass_hosts.iter().any(|r| r.matches_domain(trimmed))
         }
     }
 
@@ -1515,6 +1542,7 @@ mod tests {
             rule_index: None,
             targets,
             has_url_rules: true,
+            bypass_mitm: false,
         };
         let a = decision(vec![target("corp"), target("direct")]);
         let b = decision(vec![target("corp"), target("direct")]);

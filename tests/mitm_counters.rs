@@ -2,7 +2,7 @@
 //! intercepts a `CONNECT`, and every decrypted request is counted in the routing state's
 //! per-rule / per-profile traffic counters.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
@@ -16,12 +16,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use rusty_conduit_engine::http::mitm_tunnel::client_config_with_roots;
-use rusty_conduit_engine::logging::{AccessLogConfig, AccessLogger, LogFormat, LogLevel, Logger};
+use rusty_conduit_engine::logging::{
+    AccessLogConfig, AccessLogger, AccessRecord, LogFormat, LogLevel, Logger,
+};
 use rusty_conduit_engine::mitm::ca::CaMaterial;
 use rusty_conduit_engine::mitm::signer::LeafSigner;
 use rusty_conduit_engine::mitm::{crypto_provider, MitmOptions, MitmState};
 use rusty_conduit_engine::router::DEFAULT_RULE_LABEL;
-use rusty_conduit_engine::routing::{RoutingInput, RoutingState, TrafficSnapshot};
+use rusty_conduit_engine::routing::{
+    OneOrMany, RoutingInput, RoutingState, RuleConfig, TrafficSnapshot,
+};
 use rusty_conduit_engine::server::{EngineHandlers, ListenPlan, Server};
 use rusty_conduit_engine::upstream::DialerOptions;
 
@@ -189,4 +193,260 @@ async fn mitm_from_pem_bytes_counts_decrypted_requests() {
 
     token.cancel();
     run.await.unwrap();
+}
+
+#[tokio::test]
+async fn bypass_mitm_rule_tunnels_opaquely_while_mitm_is_enabled() {
+    let (origin_port, origin_ca) = spawn_origin().await;
+    let (mitm_cert, mitm_key, _mitm_ca_der) = test_ca("Engine MITM CA");
+
+    let mut origin_roots = RootCertStore::empty();
+    origin_roots.add(origin_ca.clone()).unwrap();
+    let upstream = client_config_with_roots(crypto_provider(), origin_roots.clone()).unwrap();
+    let mitm = MitmState::from_pem_bytes_with_upstream(
+        mitm_cert.as_bytes(),
+        mitm_key.as_bytes(),
+        &MitmOptions::default(),
+        crypto_provider(),
+        upstream,
+    )
+    .unwrap();
+
+    let mut input = RoutingInput {
+        mitm_enabled: true,
+        ..RoutingInput::default()
+    };
+    input.routing.rules.push(RuleConfig {
+        name: Some("bypass-localhost".to_string()),
+        inbound: None,
+        host: Some(OneOrMany::One("localhost".to_string())),
+        host_wildcard: None,
+        host_regex: None,
+        cidr: None,
+        ip: None,
+        port: None,
+        host_levels: None,
+        bypass: None,
+        weekday: None,
+        time: None,
+        url_wildcard: None,
+        url_regex: None,
+        keyword: None,
+        match_all: false,
+        disabled: false,
+        resolve_dns: None,
+        bypass_mitm: true,
+        target: OneOrMany::One("direct".to_string()),
+    });
+
+    let state = RoutingState::from_input(&input, DialerOptions::default())
+        .unwrap()
+        .with_connect_timeout(Duration::from_secs(3));
+    let counters = state.counters().clone();
+    let records: Arc<Mutex<Vec<AccessRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_records = Arc::clone(&records);
+    let logger = Logger::with_writer(LogLevel::Quiet, Box::new(std::io::sink()));
+    let access = AccessLogger::start(
+        AccessLogConfig::new(LogLevel::Info, LogFormat::Text, None, None),
+        logger.clone(),
+    )
+    .await
+    .unwrap()
+    .with_sink(Arc::new(move |rec| {
+        sink_records.lock().unwrap().push(rec.clone());
+    }));
+    let handlers = EngineHandlers::from_resolver(state.shared(), access, logger.clone())
+        .with_mitm(Arc::new(mitm.interceptor), false);
+    let server = Server::bind(
+        ListenPlan::Separate {
+            http: Some("127.0.0.1:0".parse().unwrap()),
+            socks: None,
+        },
+        Arc::new(handlers),
+        logger,
+    )
+    .await
+    .unwrap();
+    let proxy = server.local_http_addr().unwrap();
+    let token = server.shutdown_token();
+    let run = tokio::spawn(server.run());
+
+    // Client trusts ONLY the origin CA (not the MITM CA): handshake succeeds only if MITM is bypassed.
+    let authority = format!("localhost:{origin_port}");
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(read_head(&mut tcp).await.contains(" 200"));
+    let mut client_cfg = client_config_with_roots(crypto_provider(), origin_roots).unwrap();
+    client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let mut tls = TlsConnector::from(Arc::new(client_cfg))
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .unwrap();
+    tls.write_all(
+        format!("GET /bypass HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    let _ = tls.read_to_end(&mut resp).await;
+    assert!(
+        resp.ends_with(b"hello"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    drop(tls);
+
+    for _ in 0..200 {
+        if counters
+            .rule("bypass-localhost")
+            .is_some_and(|s| s.hits == 1 && s.active == 0)
+            && !records.lock().unwrap().is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let snap = counters.rule("bypass-localhost").expect("rule counter");
+    assert_eq!(snap.hits, 1);
+    assert_eq!(snap.active, 0);
+    assert!(snap.bytes_out > 0);
+
+    {
+        let recs = records.lock().unwrap();
+        assert!(
+            recs.iter().any(|r| matches!(
+                r,
+                AccessRecord::Http(h) if !h.mitm && h.method == "CONNECT" && h.rule == "bypass-localhost"
+            )),
+            "expected non-MITM CONNECT access record for bypass-localhost, got {recs:?}"
+        );
+    }
+
+    token.cancel();
+    run.await.unwrap();
+}
+
+#[tokio::test]
+async fn mitm_bypass_hosts_tunnels_opaquely_without_routing_rule() {
+    let (origin_port, origin_ca) = spawn_origin().await;
+    let (mitm_cert, mitm_key, _mitm_ca_der) = test_ca("Engine MITM CA");
+
+    let mut origin_roots = RootCertStore::empty();
+    origin_roots.add(origin_ca.clone()).unwrap();
+    let upstream = client_config_with_roots(crypto_provider(), origin_roots.clone()).unwrap();
+    let opts = MitmOptions {
+        bypass_hosts: vec!["localhost".parse().unwrap()],
+        ..MitmOptions::default()
+    };
+    let mitm = MitmState::from_pem_bytes_with_upstream(
+        mitm_cert.as_bytes(),
+        mitm_key.as_bytes(),
+        &opts,
+        crypto_provider(),
+        upstream,
+    )
+    .unwrap();
+
+    let state = RoutingState::from_input(&RoutingInput::default(), DialerOptions::default())
+        .unwrap()
+        .with_connect_timeout(Duration::from_secs(3));
+    let records: Arc<Mutex<Vec<AccessRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_records = Arc::clone(&records);
+    let logger = Logger::with_writer(LogLevel::Quiet, Box::new(std::io::sink()));
+    let access = AccessLogger::start(
+        AccessLogConfig::new(LogLevel::Info, LogFormat::Text, None, None),
+        logger.clone(),
+    )
+    .await
+    .unwrap()
+    .with_sink(Arc::new(move |rec| {
+        sink_records.lock().unwrap().push(rec.clone());
+    }));
+    let handlers = EngineHandlers::from_resolver(state.shared(), access, logger.clone())
+        .with_mitm(Arc::new(mitm.interceptor), false);
+    let server = Server::bind(
+        ListenPlan::Separate {
+            http: Some("127.0.0.1:0".parse().unwrap()),
+            socks: None,
+        },
+        Arc::new(handlers),
+        logger,
+    )
+    .await
+    .unwrap();
+    let proxy = server.local_http_addr().unwrap();
+    let token = server.shutdown_token();
+    let run = tokio::spawn(server.run());
+
+    let authority = format!("localhost:{origin_port}");
+    let mut tcp = TcpStream::connect(proxy).await.unwrap();
+    tcp.write_all(format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    assert!(read_head(&mut tcp).await.contains(" 200"));
+    let mut client_cfg = client_config_with_roots(crypto_provider(), origin_roots).unwrap();
+    client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let mut tls = TlsConnector::from(Arc::new(client_cfg))
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await
+        .unwrap();
+    tls.write_all(
+        format!("GET /bypass-host HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut resp = Vec::new();
+    let _ = tls.read_to_end(&mut resp).await;
+    assert!(
+        resp.ends_with(b"hello"),
+        "{}",
+        String::from_utf8_lossy(&resp)
+    );
+    drop(tls);
+
+    for _ in 0..200 {
+        if !records.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    {
+        let recs = records.lock().unwrap();
+        assert!(
+            recs.iter().any(|r| matches!(
+                r,
+                AccessRecord::Http(h) if !h.mitm && h.method == "CONNECT"
+            )),
+            "expected non-MITM CONNECT access record, got {recs:?}"
+        );
+    }
+
+    token.cancel();
+    run.await.unwrap();
+}
+
+#[test]
+fn rule_config_parses_bypass_mitm_in_toml() {
+    let default_rule: RuleConfig = toml::from_str(
+        r#"
+        host = "example.com"
+        target = "direct"
+        "#,
+    )
+    .unwrap();
+    assert!(!default_rule.bypass_mitm);
+
+    let bypass_rule: RuleConfig = toml::from_str(
+        r#"
+        host = "bank.example.com"
+        bypass_mitm = true
+        target = "direct"
+        "#,
+    )
+    .unwrap();
+    assert!(bypass_rule.bypass_mitm);
 }
