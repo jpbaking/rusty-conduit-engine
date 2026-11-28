@@ -46,7 +46,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
@@ -55,14 +55,16 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
+use crate::logging::{log_debug, AccessLogger, HttpAccessRecord, Logger};
 use crate::router::{RouteDecision, RouteRequest};
-use crate::routing::{Inbound, RouteResolver, RoutingCounters, TrafficTracker};
+use crate::routing::{
+    resolve_route_async, Inbound, RouteResolver, RoutingCounters, TrafficTracker,
+};
 use crate::server::{Connection, RoutingState, SharedRouting};
 use crate::upstream::DialError;
 use mitm_tunnel::{MitmConnect, MitmInterceptor};
@@ -118,6 +120,10 @@ impl fmt::Display for ConnectTarget {
     }
 }
 
+/// Default bound on how long an HTTP/1.1 client may take to send a complete request
+/// header block before the connection is closed (slowloris protection).
+pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The HTTP/HTTPS proxy engine. Cheap to clone.
 #[derive(Clone)]
 pub struct HttpProxy {
@@ -126,6 +132,8 @@ pub struct HttpProxy {
     pub(crate) resolver: Arc<dyn RouteResolver>,
     pub(crate) mitm: Option<Arc<MitmInterceptor>>,
     pub(crate) error_page: ErrorPageTemplate,
+    /// HTTP/1.1 header-read timeout (`None` = unbounded).
+    pub(crate) header_read_timeout: Option<Duration>,
 }
 
 impl fmt::Debug for HttpProxy {
@@ -134,6 +142,7 @@ impl fmt::Debug for HttpProxy {
             .field("routing", &*self.resolver.state())
             .field("mitm", &self.mitm.is_some())
             .field("error_page", &self.error_page)
+            .field("header_read_timeout", &self.header_read_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -156,7 +165,16 @@ impl HttpProxy {
             resolver,
             mitm: None,
             error_page: ErrorPageTemplate::builtin(),
+            header_read_timeout: Some(DEFAULT_HEADER_READ_TIMEOUT),
         }
+    }
+
+    /// Bound how long a client may take to send a complete HTTP/1.1 request header block
+    /// (default [`DEFAULT_HEADER_READ_TIMEOUT`]; `None` disables the bound). A client that
+    /// exceeds it is disconnected, releasing its connection permit.
+    pub fn with_header_read_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.header_read_timeout = timeout;
+        self
     }
 
     /// Render every proxy-generated error (forward, `CONNECT`, and decrypted MITM requests)
@@ -218,6 +236,8 @@ impl HttpProxy {
             async move { Ok::<_, Infallible>(ctx.dispatch(req).await) }
         });
         let conn = http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(self.header_read_timeout)
             .serve_connection(TokioIo::new(stream), service)
             .with_upgrades();
         let mut conn = std::pin::pin!(conn);
@@ -229,8 +249,10 @@ impl HttpProxy {
             }
         };
         if let Err(e) = result {
-            self.logger
-                .debug(format!("HTTP connection from {peer} ended with error: {e}"));
+            log_debug!(
+                self.logger,
+                "HTTP connection from {peer} ended with error: {e}"
+            );
         }
         tasks.close();
         tasks.wait().await;
@@ -291,22 +313,23 @@ impl RequestCtx {
             scheme: Some("https"),
             url: None,
         };
-        let decision = match route.resolve(&route_req) {
-            Ok(d) => d,
-            Err(denied) => {
-                let mut guard = self.access_guard("https", true, "CONNECT", target.authority());
-                guard.set_status(StatusCode::FORBIDDEN);
-                self.proxy.logger.info(format!(
-                    "CONNECT {target} from {} denied by filter: {denied}",
-                    self.peer
-                ));
-                return self.error(
-                    StatusCode::FORBIDDEN,
-                    "destination not allowed",
-                    Some(&target.authority()),
-                );
-            }
-        };
+        let decision =
+            match resolve_route_async(route.as_ref(), &route_req, state.connect_timeout).await {
+                Ok(d) => d,
+                Err(denied) => {
+                    let mut guard = self.access_guard("https", true, "CONNECT", target.authority());
+                    guard.set_status(StatusCode::FORBIDDEN);
+                    self.proxy.logger.info(format!(
+                        "CONNECT {target} from {} denied by filter: {denied}",
+                        self.peer
+                    ));
+                    return self.error(
+                        StatusCode::FORBIDDEN,
+                        "destination not allowed",
+                        Some(&target.authority()),
+                    );
+                }
+            };
         if decision.bypass_mitm || mitm.should_bypass(&target.host) {
             return tunnel::handle_resolved(self, req, target, decision).await;
         }
@@ -330,7 +353,7 @@ impl RequestCtx {
                     })
                     .await
                 }
-                Err(e) => logger.debug(format!("CONNECT upgrade from {client} failed: {e}")),
+                Err(e) => log_debug!(logger, "CONNECT upgrade from {client} failed: {e}"),
             }
         });
         connect_established()
@@ -354,6 +377,10 @@ impl RequestCtx {
         method: &str,
         target: String,
     ) -> AccessGuard {
+        if !self.proxy.access.http_enabled() {
+            // No sink will see the record: skip the clock read and field allocations.
+            return AccessGuard::untracked(self.proxy.access.clone(), self.tasks.clone());
+        }
         AccessGuard::new(
             self.proxy.access.clone(),
             self.tasks.clone(),
@@ -397,6 +424,20 @@ impl AccessGuard {
             access,
             tasks,
             record: Some(record),
+            started: Instant::now(),
+            bytes_in: Arc::new(AtomicU64::new(0)),
+            bytes_out: Arc::new(AtomicU64::new(0)),
+            traffic: None,
+        }
+    }
+
+    /// A guard that keeps byte counters and traffic tracking but emits no access record
+    /// (used when HTTP access logging is disabled).
+    pub(crate) fn untracked(access: AccessLogger, tasks: TaskTracker) -> Self {
+        Self {
+            access,
+            tasks,
+            record: None,
             started: Instant::now(),
             bytes_in: Arc::new(AtomicU64::new(0)),
             bytes_out: Arc::new(AtomicU64::new(0)),
@@ -455,9 +496,12 @@ impl Drop for AccessGuard {
         if !self.access.http_enabled() || tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let access = self.access.clone();
-        self.tasks
-            .spawn(async move { access.log_http(&record).await });
+        // Fast path: queue without spawning; only a full writer queue needs a task to wait.
+        if let Some(line) = self.access.try_log_http(&record) {
+            let access = self.access.clone();
+            self.tasks
+                .spawn(async move { access.send_http_line(line).await });
+        }
     }
 }
 
@@ -559,6 +603,62 @@ pub(crate) fn failed_route(state: &RoutingState, d: &RouteDecision) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::{AccessLogConfig, LogFormat, LogLevel};
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn header_read_timeout_closes_silent_clients() {
+        let logger = Logger::with_writer(LogLevel::Quiet, Box::new(std::io::sink()));
+        let access = AccessLogger::start(
+            AccessLogConfig::new(LogLevel::Quiet, LogFormat::Text, None, None),
+            logger.clone(),
+        )
+        .await
+        .unwrap();
+        let routing = RoutingState::from_input(
+            &crate::routing::RoutingInput::default(),
+            crate::upstream::DialerOptions::default(),
+        )
+        .unwrap()
+        .shared();
+        let proxy = HttpProxy::new(routing, access, logger);
+        assert_eq!(proxy.header_read_timeout, Some(DEFAULT_HEADER_READ_TIMEOUT));
+        let proxy = proxy.with_header_read_timeout(Some(Duration::from_millis(100)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let serve = {
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.unwrap();
+                proxy
+                    .serve(Connection {
+                        stream,
+                        peer,
+                        local: addr,
+                        shutdown,
+                    })
+                    .await;
+            })
+        };
+
+        // A client that connects but never sends a header block is disconnected.
+        let mut silent = TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        let mut buf = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), silent.read_to_end(&mut buf))
+            .await
+            .expect("silent client was not disconnected by the header-read timeout")
+            .ok();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("serve did not return after the header-read timeout")
+            .unwrap();
+        shutdown.cancel();
+    }
 
     #[test]
     fn connect_target_parsing() {

@@ -934,9 +934,55 @@ impl RuleMatcher {
         !self.disabled && self.conditions.iter().any(Condition::is_url_condition)
     }
 
+    /// Whether the rule has a `cidr`/`ip` condition with `resolve_dns` on, so routing a
+    /// hostname may need a DNS lookup. Disabled rules never need one.
+    pub fn needs_dns(&self) -> bool {
+        !self.disabled
+            && self.conditions.iter().any(|c| {
+                matches!(
+                    c,
+                    Condition::Cidr {
+                        resolve_dns: true,
+                        ..
+                    }
+                )
+            })
+    }
+
     /// AND across all conditions; disabled rules never match.
     pub fn matches(&self, ctx: &MatchContext<'_>) -> bool {
         !self.disabled && self.conditions.iter().all(|c| c.matches(ctx))
+    }
+
+    /// Whether the rule could match some request to `host:port`, judging only its host,
+    /// IP/CIDR, port, and host-level conditions. `host` must be normalized (see
+    /// [`normalize_host`]) and `ip` is its IP literal, if it is one. Conservative: any
+    /// other condition, and a `cidr`/`ip` condition with `resolve_dns` on a hostname, never
+    /// rules the host out. Never resolves DNS. Disabled rules never match.
+    pub fn may_match_host_port(&self, host: &str, ip: Option<IpAddr>, port: u16) -> bool {
+        !self.disabled
+            && self.conditions.iter().all(|c| match c {
+                Condition::Host(hosts) => hosts.iter().any(|h| h == host),
+                Condition::HostWildcard(re) => re.is_match(host),
+                Condition::HostRegex(res) => res.iter().any(|re| re.is_match(host)),
+                Condition::Cidr { nets, resolve_dns } => match ip {
+                    Some(ip) => nets.iter().any(|n| n.contains(ip)),
+                    None => *resolve_dns,
+                },
+                Condition::Port(ranges) => ranges.iter().any(|(a, b)| (*a..=*b).contains(&port)),
+                Condition::HostLevels { min, max } => {
+                    let dots = host.bytes().filter(|b| *b == b'.').count();
+                    let dots = u32::try_from(dots).unwrap_or(u32::MAX);
+                    (*min..=*max).contains(&dots)
+                }
+                Condition::Inbound(_)
+                | Condition::Bypass(_)
+                | Condition::Weekday(_)
+                | Condition::Time(_)
+                | Condition::UrlWildcard(_)
+                | Condition::UrlRegex(_)
+                | Condition::Keyword(_) => true,
+            })
     }
 }
 

@@ -198,7 +198,7 @@ impl HttpConnectDialer {
     /// `CONNECT`, for absolute-form HTTP forwarding.
     pub async fn connect_proxy(&self, timeout: Duration) -> io::Result<UpstreamStream> {
         let upstream = self.redacted_upstream();
-        with_timeout(&format!("connect to {upstream}"), timeout, async {
+        with_timeout(|| format!("connect to {upstream}"), timeout, async {
             let tcp = connect_upstream_filtered(
                 &self.proxy_host,
                 self.proxy_port,
@@ -231,7 +231,7 @@ impl UpstreamDialer for HttpConnectDialer {
         Box::pin(async move {
             let upstream = self.redacted_upstream();
             with_timeout(
-                &format!("CONNECT {target} via {upstream}"),
+                || format!("CONNECT {target} via {upstream}"),
                 timeout,
                 async {
                     let mut stream = self.connect_proxy(timeout).await?;

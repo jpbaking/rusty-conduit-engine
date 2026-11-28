@@ -1,44 +1,53 @@
-# phase-0002 — Record the change in the divergence ledger and DOX
+# phase-0002 — Server TCP_NODELAY, HTTP/1.1 header-read timeout, and drain_timeout task abort
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0001
-- Goal: Record the backlog change as a divergence-ledger entry and in the DOX Feature Map, as the engine's DOX contract requires.
+- Goal: Set `TCP_NODELAY` on accepted client sockets (`P-03`), add an HTTP/1.1 header-read timeout to defeat slowloris permit exhaustion (`B-06`), and abort remaining connection tasks when `drain_timeout` expires (`B-06`).
 - Done when: every command in `## Verify` exits 0.
-- Pattern to follow: `docs/DIVERGENCE-LEDGER.md` section `## E4 — Port \`rusty-conduit-ssh\`` (table header and row format)
+- Pattern to follow: `src/server.rs:595-626` (`accept_loop` socket options + task spawn) and `src/http/mod.rs:220-230` (`http1::Builder`)
 
 ## Context
-The engine's `DOX.md` requires an entry in `docs/DIVERGENCE-LEDGER.md` for any change to behaviour a consumer relied on. Every consumer (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, `rusty-conduit-gui`) binds through `Server::bind`, so all of them get the new backlog when they move to the next engine tag. The decision is `keep`: it becomes engine behaviour for everyone, with no option. Do not bump the version in `Cargo.toml` and do not edit `CHANGELOG`-style files; the release is a separate step.
+Accepted client sockets currently leave Nagle's algorithm enabled, causing 40–200 ms stalls with Delayed-ACK on SOCKS5 handshakes and `CONNECT` responses.
+Dedicated HTTP listeners have no header-read timeout, so silent TCP clients can hold `max_connections` permits indefinitely.
+In `Server::run`, `tokio::time::timeout(drain_timeout, tracker.wait())` logs `"connection(s) aborted"` on timeout but does not actually abort the spawned tasks, leaving stuck tasks alive in long-lived embedders like `rusty-conduit-gui`.
 
 ## Scope
-- In: `docs/DIVERGENCE-LEDGER.md`, `DOX.md`
-- Out: `src/`, `tests/`, `Cargo.toml`, `Cargo.lock`, `docs/MASTER-PLAN.md`, every other file
+- In: `src/server.rs`, `src/http/mod.rs`
+- Out: `src/http/mitm_tunnel.rs`, `src/net.rs`, `src/upstream/`, `src/router/`, `src/logging.rs`, `docs/`
 
 ## Sub-tasks
-1. [done] Append to the end of `docs/DIVERGENCE-LEDGER.md` a section `## M — Maintenance after the CLI ports` with one sentence of intro (`Engine changes made after E5 that change behaviour every consumer inherits.`), the same six-column table header as the E4 section, and one row: ID `M-01`, Module `` `server` ``, Consumers `all`, Difference `` Listeners are now bound through `bind_listener`, which requests a listen backlog of `LISTEN_BACKLOG` (4096) instead of the 128 that `TcpListener::bind` requests. The kernel still caps it (`net.core.somaxconn`, 4096 by default on Linux ≥ 5.4; `kern.ipc.somaxconn`, 128 by default on macOS). `SO_REUSEADDR` stays on for non-Windows platforms. Connection bursts larger than 128 no longer overflow the queue on Linux. ``, Decision `keep`, Landed `` `src/server.rs` (`bind_listener`, `backlog_queues_more_than_128_connections`) `` — done when: `grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md` prints one line.
-2. [done] In `DOX.md`, edit only the `## Feature Map` bullet **Listeners and graceful shutdown**: after `connection limits,` insert `a 4096 listen backlog (\`LISTEN_BACKLOG\`, capped by the kernel's somaxconn),` — done when: `grep -n 'LISTEN_BACKLOG' DOX.md` prints one line.
+1. [done] In `src/server.rs` (`accept_loop`), call `let _ = stream.set_nodelay(true);` on every accepted client socket right before/alongside `ka.apply(&stream)`. Add a unit test in `src/server.rs` verifying `conn.stream.nodelay()` is `true` inside a handler — done when: `cargo test --locked nodelay` passes.
+2. [done] In `src/http/mod.rs`, add `pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);`, store `header_read_timeout: Option<Duration>` (default `Some(DEFAULT_HEADER_READ_TIMEOUT)`) on `HttpProxy`, and add `pub fn with_header_read_timeout(mut self, timeout: Option<Duration>) -> Self`. In `HttpProxy::serve`, configure `http1::Builder::new().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(self.header_read_timeout)` (do not use `hyper_util` features not already enabled — verify `TokioTimer` compiles with existing `Cargo.toml`). Add a unit test proving a silent TCP client is closed after a short `header_read_timeout` (e.g., 100 ms) — done when: `cargo test --locked header_read_timeout` passes.
+3. [done] In `src/server.rs`, track spawned connection tasks' `AbortHandle`s in an `Arc<DashMap<u64, tokio::task::AbortHandle>>` (with an `Arc<AtomicU64>` ID counter) alongside `TaskTracker`; each spawned task removes its own ID from the `DashMap` via a drop guard when it exits (whether normally or aborted). When `tokio::time::timeout(drain_timeout, tracker.wait())` times out in `Server::run`, abort every remaining handle in the `DashMap` (`for entry in abort_handles.iter() { entry.value().abort(); }`). Add a unit test in `src/server.rs` with a handler that awaits `std::future::pending::<()>()` while holding a drop-flag `Arc<AtomicBool>`, and assert that after `drain_timeout` expires `ShutdownReport { drained: false }` is returned AND the drop-flag becomes `true` — done when: `cargo test --locked drain_timeout_aborts` passes.
+
+4. [done] Fix-up: run `cargo fmt` to repair the `cargo fmt --check` failure (import order in `src/server.rs` and a long line in the nodelay test recorder) — done when: `cargo fmt --check` exits 0.
 
 ## Verify
 ```sh
-grep -n '^## M — Maintenance after the CLI ports' docs/DIVERGENCE-LEDGER.md
-grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md
-grep -n 'LISTEN_BACKLOG' DOX.md
-git diff --exit-code -- src tests Cargo.toml Cargo.lock
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --no-default-features --locked -- -D warnings
 cargo test --locked
+cargo test --no-default-features --locked
 ```
 
 ## Escalate when
-- The ledger's existing table format differs from six columns → stop, set Status: needs-human — reason: paste the header line.
-- The Feature Map bullet text differs from `separate or single-port listeners, connection dispatch, connection limits, drain-on-shutdown` → stop, set Status: needs-human — reason: paste the current bullet.
+- `hyper_util::rt::TokioTimer` is not enabled by the existing `Cargo.toml` features (do not edit `Cargo.toml` without planner approval) → stop, set Status: needs-human — reason: paste the compiler error.
+- Any existing `src/server.rs` or `tests/` shutdown test regresses → stop, set Status: needs-human — reason: paste the failing test output.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: appended section `## M — Maintenance after the CLI ports` and row `M-01` to `docs/DIVERGENCE-LEDGER.md`
-- sub-task 2: updated `## Feature Map` bullet **Listeners and graceful shutdown** in `DOX.md`
-- verify: ran all `## Verify` commands; all passed
+- sub-task 1: `accept_loop` calls `stream.set_nodelay(true)` (debug-logs failure) before keepalive; Recorder records `conn.stream.nodelay()`; added `accepted_client_sockets_get_tcp_nodelay`
+- sub-task 2: added `DEFAULT_HEADER_READ_TIMEOUT` (30s), `HttpProxy.header_read_timeout` + `with_header_read_timeout`; `serve` uses `http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(..)`; `TokioTimer` compiled with the existing `hyper-util` `tokio` feature (Cargo.toml untouched); added `header_read_timeout_closes_silent_clients`
+- sub-task 3: added `ConnectionTasks` (`Arc<AtomicU64>` ID + `Arc<DashMap<u64, AbortHandle>>`) and `AbortHandleGuard` drop guard; `Server::run` calls `abort_all()` when the drain times out; after inserting a handle, `accept_loop` removes it again if the task already finished (avoids a stale entry when the task ended before registration); added `drain_timeout_aborts_stuck_connection_tasks`
+- Verify run 1: `cargo fmt --check` failed (formatting only); clippy x2 passed
+- sub-task 4 (fix-up 1): ran `cargo fmt`; Verify run 2 passed in full
 
 ## Evidence
 - (append-only: command → observed result)
-- `grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md` → exit 0 (1 line at line 79)
-- `grep -n 'LISTEN_BACKLOG' DOX.md` → exit 0 (1 line at line 244)
-- `grep -n '^## M — Maintenance after the CLI ports' docs/DIVERGENCE-LEDGER.md && grep -n '^| M-01 |' docs/DIVERGENCE-LEDGER.md && grep -n 'LISTEN_BACKLOG' DOX.md && git diff --exit-code -- src tests Cargo.toml Cargo.lock && cargo test --locked` → exit 0 (line 73 heading, line 79 M-01 row, line 244 DOX bullet, no diff in src/tests/Cargo.*, 164 unit + 4 integration tests passed)
+- `cargo test --locked nodelay` → `server::tests::accepted_client_sockets_get_tcp_nodelay ... ok` (plus existing `direct_connects_with_nodelay_and_keepalive ... ok`); change at src/server.rs:636, test at src/server.rs:897
+- `cargo test --locked header_read_timeout` → `http::tests::header_read_timeout_closes_silent_clients ... ok`, finished in 0.11s (100 ms timeout fired); src/http/mod.rs:123, :173, :238, test :585
+- `cargo test --locked drain_timeout_aborts` → `server::tests::drain_timeout_aborts_stuck_connection_tasks ... ok` (asserts `ShutdownReport { drained: false }` and drop flag set); src/server.rs:72, :87, :577, :675, test :1152
+- Verify run 1: `cargo fmt --check` → diff in src/server.rs (import order, line wrap); `cargo clippy --all-targets --locked -- -D warnings` → Finished, no warnings; `cargo clippy --all-targets --no-default-features --locked -- -D warnings` → Finished, no warnings
+- Verify run 2 (after `cargo fmt`): `cargo fmt --check` → exit 0; both clippy runs → Finished, no warnings; `cargo test --locked` → 185+5+4+6+2+1+0 passed, 0 failed (203 total, was 200); `cargo test --no-default-features --locked` → 174+5+4+6+2+0+0 passed, 0 failed (191 total, was 188); existing shutdown tests `shutdown_drain_is_bounded` / `shutdown_drains_connections_that_honour_cancellation` still pass

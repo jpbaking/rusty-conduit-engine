@@ -22,7 +22,7 @@ pub mod validate;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use crate::filter::{AccessDenied, HostFilter};
 use crate::routing::{
@@ -155,6 +155,19 @@ impl RouteDecision {
     }
 }
 
+/// A [`Resolver`] answering every lookup from a fixed, pre-resolved address list.
+struct SliceResolver<'a>(&'a [IpAddr]);
+
+impl Resolver for SliceResolver<'_> {
+    fn resolve(&self, _host: &str, _port: u16) -> Vec<IpAddr> {
+        self.0
+            .iter()
+            .copied()
+            .map(condition::canonical_ip)
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CompiledRule {
     label: String,
@@ -170,6 +183,7 @@ struct Table {
     default: Option<Vec<String>>,
     inherit: bool,
     has_url_rules: bool,
+    has_dns_rules: bool,
 }
 
 impl Table {
@@ -203,6 +217,7 @@ impl Table {
         Ok(Self {
             kind,
             has_url_rules: rules.iter().any(|r| r.matcher.has_url_conditions()),
+            has_dns_rules: rules.iter().any(|r| r.matcher.needs_dns()),
             rules,
             default: default.map(|d| d.as_slice().to_vec()),
             inherit,
@@ -305,6 +320,37 @@ impl Router {
         }
     }
 
+    /// Whether any table consulted for `inbound` traffic has a `cidr`/`ip` rule with
+    /// `resolve_dns` on, so routing a hostname may need a DNS lookup.
+    pub fn needs_dns(&self, inbound: Inbound) -> bool {
+        match self.split_for(inbound) {
+            Some(t) => t.has_dns_rules || (t.inherit && self.unified.has_dns_rules),
+            None => self.unified.has_dns_rules,
+        }
+    }
+
+    /// Whether a URL rule in a table consulted for `inbound` traffic could match some
+    /// request to `host:port`: `false` when none can, so a `CONNECT` to it can be routed
+    /// once instead of per decrypted request. Conservative (see
+    /// [`RuleMatcher::may_match_host_port`]); never resolves DNS.
+    pub fn host_may_match_url_rules(&self, inbound: Inbound, host: &str, port: u16) -> bool {
+        if !self.has_url_rules(inbound) {
+            return false;
+        }
+        let host = normalize_host(host);
+        let ip = condition::parse_ip_literal(&host);
+        let may_match = |t: &Table| {
+            t.has_url_rules
+                && t.rules.iter().any(|r| {
+                    r.matcher.has_url_conditions() && r.matcher.may_match_host_port(&host, ip, port)
+                })
+        };
+        match self.split_for(inbound) {
+            Some(t) => may_match(t) || (t.inherit && may_match(&self.unified)),
+            None => may_match(&self.unified),
+        }
+    }
+
     fn split_for(&self, inbound: Inbound) -> Option<&Table> {
         match inbound {
             Inbound::Http => self.http.as_ref(),
@@ -315,6 +361,16 @@ impl Router {
     /// Route with the system clock and (opt-in only) the OS resolver.
     pub fn route(&self, req: &RouteRequest<'_>) -> Result<RouteDecision, AccessDenied> {
         self.route_with(req, &SystemClock, &SystemResolver)
+    }
+
+    /// Route with the system clock, answering `resolve_dns` lookups from `ips` (already
+    /// resolved by the caller, for example asynchronously). Never performs DNS itself.
+    pub fn route_with_ips(
+        &self,
+        req: &RouteRequest<'_>,
+        ips: &[IpAddr],
+    ) -> Result<RouteDecision, AccessDenied> {
+        self.route_with(req, &SystemClock, &SliceResolver(ips))
     }
 
     /// Route with an injected clock and resolver (deterministic tests, dry runs).
@@ -727,6 +783,118 @@ mod tests {
         assert!(r.has_url_rules(Inbound::Http));
         assert!(!r.has_url_rules(Inbound::Socks));
         assert!(route(&r, Inbound::Http, "h", 1).has_url_rules);
+    }
+
+    #[test]
+    fn needs_dns_follows_resolve_dns_and_active_tables() {
+        let r = router("[[routing.rules]]\ncidr = \"10.0.0.0/8\"\ntarget = \"direct\"\n");
+        assert!(!r.needs_dns(Inbound::Http));
+        let r = router(
+            "[[routing.rules]]\ncidr = \"10.0.0.0/8\"\nresolve_dns = true\ntarget = \"direct\"\n",
+        );
+        assert!(r.needs_dns(Inbound::Http));
+        assert!(r.needs_dns(Inbound::Socks));
+        // The global switch applies; a disabled rule never needs DNS.
+        let r = router(
+            "[routing]\nresolve_dns = true\n[[routing.rules]]\ncidr = \"10.0.0.0/8\"\n\
+             target = \"direct\"\n",
+        );
+        assert!(r.needs_dns(Inbound::Http));
+        let r = router(
+            "[[routing.rules]]\ncidr = \"10.0.0.0/8\"\nresolve_dns = true\ndisabled = true\n\
+             target = \"direct\"\n",
+        );
+        assert!(!r.needs_dns(Inbound::Http));
+        // Split tables: unified DNS rules count only with `inherit`.
+        let r = router(
+            "[[routing.rules]]\ncidr = \"10.0.0.0/8\"\nresolve_dns = true\ntarget = \"direct\"\n\
+             [routing.socks]\n[routing.http]\ninherit = true\n",
+        );
+        assert!(r.needs_dns(Inbound::Http));
+        assert!(!r.needs_dns(Inbound::Socks));
+    }
+
+    #[test]
+    fn route_with_ips_answers_resolve_dns_from_slice() {
+        let r = router(
+            "[profiles.p]\ntype = \"socks5\"\nhost = \"127.0.0.1\"\nport = 1081\n\
+             [[routing.rules]]\nname = \"lan\"\ncidr = \"10.0.0.0/8\"\nresolve_dns = true\n\
+             target = \"p\"\n",
+        );
+        let req = RouteRequest::new(Inbound::Http, "lan.example", 443);
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let d = r.route_with_ips(&req, &[ip("10.1.2.3")]).unwrap();
+        assert_eq!(d.rule.as_deref(), Some("lan"));
+        assert_eq!(d.profile_label(), "p");
+        // IPv4-mapped IPv6 is canonicalized before matching.
+        let d = r.route_with_ips(&req, &[ip("::ffff:10.1.2.3")]).unwrap();
+        assert_eq!(d.rule.as_deref(), Some("lan"));
+        let d = r.route_with_ips(&req, &[ip("192.168.0.1")]).unwrap();
+        assert_eq!(d.rule, None);
+        let d = r.route_with_ips(&req, &[]).unwrap();
+        assert_eq!(d.rule, None);
+    }
+
+    #[test]
+    fn host_may_match_url_rules_scopes_to_rule_hosts() {
+        // No URL rules at all.
+        let r = router("[[routing.rules]]\nhost = \"a.test\"\ntarget = \"direct\"\n");
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "a.test", 443));
+
+        // A URL rule scoped to one host (and port) only.
+        let r = router(
+            "[[routing.rules]]\nhost = \"a.test\"\nport = \"443\"\nkeyword = \"k\"\n\
+             target = \"direct\"\n",
+        );
+        assert!(r.has_url_rules(Inbound::Http));
+        assert!(r.host_may_match_url_rules(Inbound::Http, "a.test", 443));
+        assert!(r.host_may_match_url_rules(Inbound::Http, "A.Test.", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "b.test", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "a.test", 8443));
+
+        // An unscoped URL rule may match any host.
+        let r = router("[[routing.rules]]\nkeyword = \"k\"\ntarget = \"direct\"\n");
+        for host in ["a.test", "b.test", "10.0.0.1", "::1"] {
+            assert!(
+                r.host_may_match_url_rules(Inbound::Http, host, 443),
+                "{host}"
+            );
+        }
+
+        // CIDR-scoped: IP literals are checked, hostnames only match with `resolve_dns`.
+        let r = router(
+            "[[routing.rules]]\ncidr = \"10.0.0.0/8\"\nkeyword = \"k\"\ntarget = \"direct\"\n",
+        );
+        assert!(r.host_may_match_url_rules(Inbound::Http, "10.1.2.3", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "192.168.0.1", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "a.test", 443));
+        let r = router(
+            "[[routing.rules]]\ncidr = \"10.0.0.0/8\"\nresolve_dns = true\nkeyword = \"k\"\n\
+             target = \"direct\"\n",
+        );
+        assert!(r.host_may_match_url_rules(Inbound::Http, "a.test", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "192.168.0.1", 443));
+    }
+
+    #[test]
+    fn host_may_match_url_rules_follows_active_tables() {
+        let r = router(
+            "[[routing.rules]]\nhost = \"a.test\"\nkeyword = \"k\"\ntarget = \"direct\"\n\
+             [routing.socks]\n[routing.http]\ninherit = true\n\
+             [[routing.http.rules]]\nhost = \"b.test\"\nkeyword = \"k\"\ntarget = \"direct\"\n",
+        );
+        assert!(r.host_may_match_url_rules(Inbound::Http, "a.test", 443));
+        assert!(r.host_may_match_url_rules(Inbound::Http, "b.test", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "c.test", 443));
+        assert!(!r.host_may_match_url_rules(Inbound::Socks, "a.test", 443));
+        // Without `inherit`, unified URL rules are not consulted.
+        let r = router(
+            "[[routing.rules]]\nhost = \"a.test\"\nkeyword = \"k\"\ntarget = \"direct\"\n\
+             [routing.http]\n\
+             [[routing.http.rules]]\nhost = \"b.test\"\nkeyword = \"k\"\ntarget = \"direct\"\n",
+        );
+        assert!(!r.host_may_match_url_rules(Inbound::Http, "a.test", 443));
+        assert!(r.host_may_match_url_rules(Inbound::Http, "b.test", 443));
     }
 
     #[test]

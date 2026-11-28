@@ -53,7 +53,7 @@ impl UpstreamDialer for Socks4aDialer {
         Box::pin(async move {
             let request = encode_connect_request(&host, port, &self.user_id)?;
             let upstream = self.redacted_upstream();
-            with_timeout(&format!("SOCKS4a upstream {upstream}"), timeout, async {
+            with_timeout(|| format!("SOCKS4a upstream {upstream}"), timeout, async {
                 let mut stream = connect_upstream_filtered(
                     &self.proxy_host,
                     self.proxy_port,

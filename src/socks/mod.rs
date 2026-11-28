@@ -38,11 +38,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::http::tunnel::CountingStream;
-use crate::logging::{AccessLogger, Logger, SocksLogRecord};
+use crate::logging::{log_debug, AccessLogger, Logger, SocksLogRecord};
 use crate::mux::{self, DetectedProtocol};
 use crate::net::relay_bidirectional;
 use crate::router::{RouteDecision, RouteRequest};
-use crate::routing::{Inbound, RouteResolver, TrafficTracker};
+use crate::routing::{resolve_route_async, Inbound, RouteResolver, TrafficTracker};
 use crate::server::{Connection, RoutingState, SharedRouting};
 use crate::upstream::{dial_error, DialError, UpstreamStream};
 
@@ -234,17 +234,21 @@ impl SocksProxy {
         match sniffed {
             Ok(DetectedProtocol::Socks4) => self.serve_v4(conn).await,
             Ok(DetectedProtocol::Socks5) => self.serve_v5(conn).await,
-            Ok(DetectedProtocol::Http) => self.logger.debug(format!(
+            Ok(DetectedProtocol::Http) => log_debug!(
+                self.logger,
                 "rejected SOCKS connection from {}: HTTP request on SOCKS port",
                 conn.peer
-            )),
-            Ok(DetectedProtocol::Unknown(b)) => self.logger.debug(format!(
+            ),
+            Ok(DetectedProtocol::Unknown(b)) => log_debug!(
+                self.logger,
                 "rejected SOCKS connection from {}: unknown version byte 0x{b:02x}",
                 conn.peer
-            )),
-            Err(e) => self
-                .logger
-                .debug(format!("rejected SOCKS connection from {}: {e}", conn.peer)),
+            ),
+            Err(e) => log_debug!(
+                self.logger,
+                "rejected SOCKS connection from {}: {e}",
+                conn.peer
+            ),
         }
     }
 
@@ -268,16 +272,14 @@ impl SocksProxy {
     ) -> Option<T> {
         tokio::select! {
             () = shutdown.cancelled() => {
-                self.logger.debug(format!("{what} from {peer} aborted by shutdown"));
+                log_debug!(self.logger, "{what} from {peer} aborted by shutdown");
                 None
             }
             res = tokio::time::timeout(self.handshake_timeout, fut) => match res {
                 Ok(v) => Some(v),
                 Err(_) => {
-                    self.logger.debug(format!(
-                        "{what} from {peer} timed out after {}",
-                        humantime::format_duration(self.handshake_timeout)
-                    ));
+                    log_debug!(self.logger, "{what} from {peer} timed out after {}",
+                        humantime::format_duration(self.handshake_timeout));
                     None
                 }
             },
@@ -296,16 +298,18 @@ impl SocksProxy {
         let state: Arc<RoutingState> = route.state();
         let host = target.dial_host();
         let proto = session.proto;
-        let decision = match route.resolve(&RouteRequest::new(Inbound::Socks, &host, target.port)) {
-            Ok(d) => d,
-            Err(denied) => {
-                self.logger.info(format!(
-                    "{proto} {target} from {} denied by filter: {denied}",
-                    session.client
-                ));
-                return Some(Err(Failure::NotAllowed));
-            }
-        };
+        let route_req = RouteRequest::new(Inbound::Socks, &host, target.port);
+        let decision =
+            match resolve_route_async(route.as_ref(), &route_req, state.connect_timeout).await {
+                Ok(d) => d,
+                Err(denied) => {
+                    self.logger.info(format!(
+                        "{proto} {target} from {} denied by filter: {denied}",
+                        session.client
+                    ));
+                    return Some(Err(Failure::NotAllowed));
+                }
+            };
         session.rule = decision.rule_label().to_string();
         session.profile = decision.profile_label();
         session.upstream = state.first_upstream(&decision);
@@ -331,10 +335,14 @@ impl SocksProxy {
                     .map(|t| t.label())
                     .unwrap_or(outcome.profile);
                 session.upstream = outcome.upstream;
-                self.logger.debug(format!(
+                log_debug!(
+                    self.logger,
                     "{proto} {target} from {}: rule={} profile={} upstream={}",
-                    session.client, session.rule, session.profile, session.upstream
-                ));
+                    session.client,
+                    session.rule,
+                    session.profile,
+                    session.upstream
+                );
                 Ok(outcome.stream)
             }
             Err(e) => {
@@ -390,12 +398,12 @@ impl SocksProxy {
                 }
                 Ok(None) => "ok".to_string(),
                 Err(e) => {
-                    self.logger.debug(format!("SOCKS session {peer} -> {target} ended: {e}"));
+                    log_debug!(self.logger, "SOCKS session {peer} -> {target} ended: {e}");
                     "ok".to_string()
                 }
             },
             () = shutdown.cancelled() => {
-                self.logger.debug(format!("SOCKS session {peer} -> {target} closed by shutdown"));
+                log_debug!(self.logger, "SOCKS session {peer} -> {target} closed by shutdown");
                 "ok".to_string()
             }
         };
@@ -461,7 +469,6 @@ pub(crate) fn bound_addr(stream: &UpstreamStream) -> Option<SocketAddr> {
 
 /// One SOCKS session being logged.
 pub(crate) struct Session {
-    ts: OffsetDateTime,
     start: Instant,
     pub(crate) client: SocketAddr,
     pub(crate) proto: &'static str,
@@ -484,7 +491,6 @@ impl Session {
 
     pub(crate) fn new(client: SocketAddr, proto: &'static str) -> Self {
         Self {
-            ts: OffsetDateTime::now_utc(),
             start: Instant::now(),
             client,
             proto,
@@ -501,8 +507,16 @@ impl Session {
         if let Some(traffic) = self.traffic.take() {
             traffic.finish(bin, bout);
         }
+        if !access.socks_enabled() {
+            // No sink will see the record: skip the clock read and record construction.
+            return;
+        }
+        let elapsed = self.start.elapsed();
         let record = SocksLogRecord {
-            ts: self.ts,
+            // Wall-clock session start, read only when a record is actually emitted.
+            ts: OffsetDateTime::now_utc()
+                .checked_sub(time::Duration::try_from(elapsed).unwrap_or(time::Duration::ZERO))
+                .unwrap_or_else(OffsetDateTime::now_utc),
             direction: None,
             client: self.client,
             proto: self.proto.into(),
@@ -514,7 +528,7 @@ impl Session {
             status: status.into(),
             bytes_in: bin,
             bytes_out: bout,
-            duration_ms: u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         };
         access.log_socks(&record).await;
     }

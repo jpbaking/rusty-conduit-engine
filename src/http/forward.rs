@@ -27,8 +27,9 @@ use hyper_util::rt::TokioIo;
 
 use super::error_page::page_target;
 use super::{dial_error_status, failed_route, CountingBody, ProxyBody, RequestCtx};
+use crate::logging::log_debug;
 use crate::router::{ResolvedTarget, RouteRequest};
-use crate::routing::Inbound;
+use crate::routing::{resolve_route_async, Inbound};
 use crate::server::RoutingState;
 use crate::upstream::{
     DialFuture, FailoverDialer, HttpConnectDialer, UpstreamDialer, UpstreamError,
@@ -172,7 +173,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         Ok(t) => t,
         Err(msg) => {
             guard.set_status(StatusCode::BAD_REQUEST);
-            logger.debug(format!("rejected request from {}: {msg}", ctx.peer));
+            log_debug!(logger, "rejected request from {}: {msg}", ctx.peer);
             let target = req.uri().authority().and_then(|a| page_target(a.as_str()));
             return ctx.error(StatusCode::BAD_REQUEST, msg, target);
         }
@@ -188,17 +189,18 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         scheme: Some("http"),
         url: Some(&absolute),
     };
-    let decision = match ctx.route.resolve(&route_req) {
-        Ok(d) => d,
-        Err(denied) => {
-            guard.set_status(StatusCode::FORBIDDEN);
-            logger.info(format!(
-                "request {absolute} from {} denied by filter: {denied}",
-                ctx.peer
-            ));
-            return ctx.error(StatusCode::FORBIDDEN, "destination not allowed", page);
-        }
-    };
+    let decision =
+        match resolve_route_async(ctx.route.as_ref(), &route_req, state.connect_timeout).await {
+            Ok(d) => d,
+            Err(denied) => {
+                guard.set_status(StatusCode::FORBIDDEN);
+                logger.info(format!(
+                    "request {absolute} from {} denied by filter: {denied}",
+                    ctx.peer
+                ));
+                return ctx.error(StatusCode::FORBIDDEN, "destination not allowed", page);
+            }
+        };
     let rule = decision.rule_label().to_string();
     let chain = match forward_chain(&state, &decision.targets) {
         Ok(c) => c.with_logger(logger.clone()),
@@ -283,10 +285,12 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         }
         None => parts.uri = target.origin.clone(),
     }
-    logger.debug(format!(
+    log_debug!(
+        logger,
         "{} {absolute} from {}: rule={rule} profile={profile} upstream={upstream}",
-        parts.method, ctx.peer
-    ));
+        parts.method,
+        ctx.peer
+    );
     guard.track(
         &state.counters,
         &rule,
@@ -312,7 +316,7 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         tokio::select! {
             res = conn => {
                 if let Err(e) = res {
-                    conn_logger.debug(format!("upstream connection error: {e}"));
+                    log_debug!(conn_logger, "upstream connection error: {e}");
                 }
             }
             () = shutdown.cancelled() => {}

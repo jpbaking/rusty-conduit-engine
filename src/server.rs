@@ -10,7 +10,8 @@
 //!
 //! Shutdown cancels a shared [`CancellationToken`]: accept loops stop immediately, every
 //! connection task receives a child token, and in-flight connections are drained for at
-//! most [`Server::drain_timeout`].
+//! most [`Server::drain_timeout`]; connection tasks still running when it expires are
+//! aborted.
 //!
 //! An optional connection cap ([`Server::with_max_connections`]) is shared by all listeners.
 //! When it is full, a newly accepted connection is closed at once rather than queued, so
@@ -22,17 +23,20 @@ use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::Semaphore;
+use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::http::mitm_tunnel::MitmInterceptor;
 use crate::http::{ErrorPageTemplate, HttpProxy};
-use crate::logging::{AccessLogger, Logger};
+use crate::logging::{log_debug, log_verbose, AccessLogger, Logger};
 use crate::mux::{self, DetectedProtocol, DEFAULT_SNIFF_TIMEOUT};
 use crate::net::KeepaliveSettings;
 use crate::socks::web_guard::WebGuard;
@@ -61,6 +65,34 @@ fn bind_listener(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(LISTEN_BACKLOG)
+}
+
+/// Abort handles of live connection tasks, keyed by a per-server task ID.
+#[derive(Clone, Default)]
+struct ConnectionTasks {
+    next_id: Arc<AtomicU64>,
+    handles: Arc<DashMap<u64, AbortHandle>>,
+}
+
+impl ConnectionTasks {
+    /// Abort every connection task that is still registered.
+    fn abort_all(&self) {
+        for entry in self.handles.iter() {
+            entry.value().abort();
+        }
+    }
+}
+
+/// Removes a connection task's abort handle when the task ends, normally or aborted.
+struct AbortHandleGuard {
+    id: u64,
+    handles: Arc<DashMap<u64, AbortHandle>>,
+}
+
+impl Drop for AbortHandleGuard {
+    fn drop(&mut self) {
+        self.handles.remove(&self.id);
+    }
 }
 
 /// Boxed future returned by protocol handlers.
@@ -103,10 +135,11 @@ impl StubHandlers {
     fn reject(&self, proto: &'static str, conn: Connection) -> HandlerFuture {
         let logger = self.logger.clone();
         Box::pin(async move {
-            logger.debug(format!(
+            log_debug!(
+                logger,
                 "{proto} connection from {} closed: protocol engine not available",
                 conn.peer
-            ));
+            );
             drop(conn);
         })
     }
@@ -332,7 +365,8 @@ pub enum ServerError {
 /// Outcome of a completed [`Server::run`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShutdownReport {
-    /// `true` if every in-flight connection finished within the drain timeout.
+    /// `true` if every in-flight connection finished within the drain timeout. When
+    /// `false`, the remaining connection tasks were aborted.
     pub drained: bool,
 }
 
@@ -504,6 +538,7 @@ impl Server {
             runtime,
         } = self;
 
+        let tasks = ConnectionTasks::default();
         let mut accept_loops = tokio::task::JoinSet::new();
         for (role, addr, listener) in listeners {
             accept_loops.spawn(accept_loop(AcceptCtx {
@@ -514,6 +549,7 @@ impl Server {
                 logger: logger.clone(),
                 shutdown: shutdown.clone(),
                 tracker: tracker.clone(),
+                tasks: tasks.clone(),
                 sniff_timeout,
                 connection_limit: connection_limit.clone(),
                 keepalive,
@@ -525,10 +561,11 @@ impl Server {
         tracker.close();
         let active = tracker.len();
         if active > 0 {
-            logger.debug(format!(
+            log_debug!(
+                logger,
                 "draining {active} active connection(s) (timeout {})",
                 humantime::format_duration(drain_timeout)
-            ));
+            );
         }
         let drained = tokio::time::timeout(drain_timeout, tracker.wait())
             .await
@@ -539,6 +576,7 @@ impl Server {
                 humantime::format_duration(drain_timeout),
                 tracker.len()
             ));
+            tasks.abort_all();
         }
         ShutdownReport { drained }
     }
@@ -552,6 +590,7 @@ struct AcceptCtx {
     logger: Logger,
     shutdown: CancellationToken,
     tracker: TaskTracker,
+    tasks: ConnectionTasks,
     sniff_timeout: Duration,
     connection_limit: Option<Arc<Semaphore>>,
     keepalive: Option<KeepaliveSettings>,
@@ -582,10 +621,8 @@ async fn accept_loop(ctx: AcceptCtx) {
             Some(limit) => match Arc::clone(limit).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => {
-                    ctx.logger.debug(format!(
-                        "dropped connection from {peer} on {} listener {}: connection limit reached",
-                        ctx.role, ctx.addr
-                    ));
+                    log_debug!(ctx.logger, "dropped connection from {peer} on {} listener {}: connection limit reached",
+                        ctx.role, ctx.addr);
                     drop(stream);
                     continue;
                 }
@@ -596,16 +633,20 @@ async fn accept_loop(ctx: AcceptCtx) {
             Some(rt) => rt.load().keepalive,
             None => ctx.keepalive,
         };
+        if let Err(e) = stream.set_nodelay(true) {
+            log_debug!(ctx.logger, "failed to enable TCP_NODELAY for {peer}: {e}");
+        }
         if let Some(ka) = &keepalive {
             if let Err(e) = ka.apply(&stream) {
-                ctx.logger
-                    .debug(format!("failed to enable TCP keepalive for {peer}: {e}"));
+                log_debug!(ctx.logger, "failed to enable TCP keepalive for {peer}: {e}");
             }
         }
-        ctx.logger.verbose(format!(
+        log_verbose!(
+            ctx.logger,
             "accepted connection from {peer} on {} listener {}",
-            ctx.role, ctx.addr
-        ));
+            ctx.role,
+            ctx.addr
+        );
         let conn = Connection {
             stream,
             peer,
@@ -619,13 +660,23 @@ async fn accept_loop(ctx: AcceptCtx) {
             ctx.logger.clone(),
             ctx.sniff_timeout,
         );
-        ctx.tracker.spawn(async move {
+        let id = ctx.tasks.next_id.fetch_add(1, Ordering::Relaxed);
+        let guard = AbortHandleGuard {
+            id,
+            handles: Arc::clone(&ctx.tasks.handles),
+        };
+        let handle = ctx.tracker.spawn(async move {
+            let _guard = guard;
             let _permit = permit;
             connection.await;
         });
+        ctx.tasks.handles.insert(id, handle.abort_handle());
+        // The task may have ended before its handle was registered; drop the stale entry.
+        if handle.is_finished() {
+            ctx.tasks.handles.remove(&id);
+        }
     }
-    ctx.logger
-        .debug(format!("{} listener {} stopped", ctx.role, ctx.addr));
+    log_debug!(ctx.logger, "{} listener {} stopped", ctx.role, ctx.addr);
 }
 
 async fn dispatch(
@@ -650,19 +701,19 @@ async fn dispatch(
             handlers.http(conn).await
         }
         Ok(DetectedProtocol::Http) => {
-            logger.debug(format!(
+            log_debug!(
+                logger,
                 "rejected connection from {peer} on {role} listener: HTTP request on SOCKS port"
-            ));
+            );
         }
         Ok(DetectedProtocol::Unknown(byte)) => {
-            logger.debug(format!(
-                "rejected connection from {peer} on {role} listener: unknown first byte 0x{byte:02x}"
-            ));
+            log_debug!(logger, "rejected connection from {peer} on {role} listener: unknown first byte 0x{byte:02x}");
         }
         Err(e) => {
-            logger.debug(format!(
+            log_debug!(
+                logger,
                 "rejected connection from {peer} on {role} listener: {e}"
-            ));
+            );
         }
     }
 }
@@ -689,6 +740,8 @@ mod tests {
         seen: Mutex<Vec<(&'static str, u8)>>,
         /// Whether `SO_KEEPALIVE` was set on each accepted client socket.
         keepalive: Mutex<Vec<bool>>,
+        /// Whether `TCP_NODELAY` was set on each accepted client socket.
+        nodelay: Mutex<Vec<bool>>,
     }
 
     impl Recorder {
@@ -697,6 +750,10 @@ mod tests {
             Box::pin(async move {
                 let ka = socket2::SockRef::from(&conn.stream).keepalive().unwrap();
                 me.keepalive.lock().unwrap().push(ka);
+                me.nodelay
+                    .lock()
+                    .unwrap()
+                    .push(conn.stream.nodelay().unwrap());
                 let mut first = [0u8; 1];
                 conn.stream.read_exact(&mut first).await.unwrap();
                 me.seen.lock().unwrap().push((tag, first[0]));
@@ -833,6 +890,26 @@ mod tests {
             token.cancel();
             run.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn accepted_client_sockets_get_tcp_nodelay() {
+        let (server, rec) = start(ListenPlan::Separate {
+            http: Some(loopback(0)),
+            socks: Some(loopback(0)),
+        })
+        .await;
+        let http = server.local_http_addr().unwrap();
+        let socks = server.local_socks_addr().unwrap();
+        let token = server.shutdown_token();
+        let run = tokio::spawn(server.run());
+
+        assert_eq!(roundtrip(http, b"GET / HTTP/1.1\r\n\r\n").await, b"http");
+        assert_eq!(roundtrip(socks, &[0x05, 0x01, 0x00]).await, b"socks5");
+        assert_eq!(*rec.nodelay.lock().unwrap(), vec![true; 2]);
+
+        token.cancel();
+        run.await.unwrap();
     }
 
     #[tokio::test]
@@ -1031,6 +1108,85 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drain_is_bounded() {
         assert!(!run_holding(true).await.drained);
+    }
+
+    /// Sets its flag when dropped (i.e. when the owning task ends or is aborted).
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Handler that ignores shutdown and never finishes, holding a [`DropFlag`].
+    struct Stuck {
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+        started: Arc<tokio::sync::Notify>,
+    }
+    impl Stuck {
+        fn hold(&self, conn: Connection) -> HandlerFuture {
+            let flag = DropFlag(Arc::clone(&self.dropped));
+            let started = Arc::clone(&self.started);
+            Box::pin(async move {
+                let _flag = flag;
+                let _conn = conn;
+                started.notify_one();
+                std::future::pending::<()>().await;
+            })
+        }
+    }
+    impl ProtocolHandlers for Stuck {
+        fn http(&self, conn: Connection) -> HandlerFuture {
+            self.hold(conn)
+        }
+        fn socks4(&self, conn: Connection) -> HandlerFuture {
+            self.hold(conn)
+        }
+        fn socks5(&self, conn: Connection) -> HandlerFuture {
+            self.hold(conn)
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_aborts_stuck_connection_tasks() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handlers = Stuck {
+            dropped: Arc::clone(&dropped),
+            started: Arc::clone(&started),
+        };
+        let server = Server::bind(
+            ListenPlan::Separate {
+                http: Some(loopback(0)),
+                socks: None,
+            },
+            Arc::new(handlers),
+            quiet(),
+        )
+        .await
+        .unwrap()
+        .with_drain_timeout(Duration::from_millis(200));
+        let addr = server.local_http_addr().unwrap();
+        let token = server.shutdown_token();
+        let run = tokio::spawn(server.run());
+        let _client = TcpStream::connect(addr).await.unwrap();
+        started.notified().await;
+        assert!(!dropped.load(Ordering::SeqCst));
+        token.cancel();
+        let report = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report, ShutdownReport { drained: false });
+        // Aborting is asynchronous: the task's future is dropped when the runtime next
+        // processes it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stuck connection task was not aborted after drain_timeout");
     }
 
     #[tokio::test]

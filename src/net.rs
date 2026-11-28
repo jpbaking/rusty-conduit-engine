@@ -113,8 +113,8 @@ fn timed_out(host: &str, port: u16, timeout: Duration) -> io::Error {
 /// Open a fresh TCP connection to `host:port` with `TCP_NODELAY` enabled (no keepalive).
 ///
 /// `host` may be a DNS name or an IP literal (IPv6 literals with or without brackets). Name
-/// resolution is performed by the OS on each call (zero DNS caching); every resolved address
-/// is tried in order until one connects. The whole resolve + connect sequence is bounded by
+/// resolution is performed by the OS on each call (zero DNS caching); resolved addresses are
+/// dialed with RFC 8305 Happy Eyeballs (IPv6/IPv4 interleaved, attempts staggered by 250 ms). The whole resolve + connect sequence is bounded by
 /// `timeout`, after which an [`io::ErrorKind::TimedOut`] error is returned.
 pub async fn connect_upstream(host: &str, port: u16, timeout: Duration) -> io::Result<TcpStream> {
     connect_upstream_filtered(host, port, timeout, None, None).await
@@ -137,14 +137,20 @@ pub async fn connect_upstream_filtered(
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
 
+    let deadline = Instant::now() + timeout;
     let Some(filter) = filter else {
-        let stream = tokio::time::timeout(timeout, TcpStream::connect((host, port)))
-            .await
-            .map_err(|_| timed_out(host, port, timeout))??;
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let stream =
+                tokio::time::timeout(timeout, TcpStream::connect(SocketAddr::new(ip, port)))
+                    .await
+                    .map_err(|_| timed_out(host, port, timeout))??;
+            return prepare_upstream(stream, keepalive);
+        }
+        let resolved = resolve_within(host, port, deadline, timeout).await?;
+        let stream = connect_happy_eyeballs(resolved, deadline, host, port, timeout).await?;
         return prepare_upstream(stream, keepalive);
     };
 
-    let deadline = Instant::now() + timeout;
     if let Ok(ip) = host.parse::<IpAddr>() {
         filter.check_ip(ip).map_err(access_denied_error)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -182,17 +188,7 @@ pub async fn connect_upstream_filtered(
         _ => {}
     }
 
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let resolved: Vec<SocketAddr> = tokio::time::timeout(remaining, lookup_host((host, port)))
-        .await
-        .map_err(|_| timed_out(host, port, timeout))??
-        .collect();
-    if resolved.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            format!("DNS returned no addresses for {host}"),
-        ));
-    }
+    let resolved = resolve_within(host, port, deadline, timeout).await?;
 
     let candidates: Vec<SocketAddr> = match filter {
         HostFilter::Block(_) => {
@@ -236,33 +232,130 @@ pub async fn connect_upstream_filtered(
         }
     };
 
-    let mut last_err = None;
-    for addr in candidates {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(timed_out(host, port, timeout));
-        }
-        match tokio::time::timeout(remaining, TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => return prepare_upstream(stream, keepalive),
-            Ok(Err(e)) => last_err = Some(e),
-            Err(_) => return Err(timed_out(host, port, timeout)),
+    let stream = connect_happy_eyeballs(candidates, deadline, host, port, timeout).await?;
+    prepare_upstream(stream, keepalive)
+}
+
+/// Resolve `host:port` through the OS resolver (fresh on every call, never cached), bounded
+/// by `deadline`. An empty answer is an [`io::ErrorKind::AddrNotAvailable`] error.
+async fn resolve_within(
+    host: &str,
+    port: u16,
+    deadline: Instant,
+    timeout: Duration,
+) -> io::Result<Vec<SocketAddr>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let resolved: Vec<SocketAddr> = tokio::time::timeout(remaining, lookup_host((host, port)))
+        .await
+        .map_err(|_| timed_out(host, port, timeout))??
+        .collect();
+    if resolved.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("DNS returned no addresses for {host}"),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// Delay between staggered Happy Eyeballs connection attempts (RFC 8305 §5).
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+
+/// Reorder `addrs` so IPv6 and IPv4 addresses alternate (RFC 8305 §4), starting with the
+/// family of the first address and preserving the relative order within each family.
+fn interleave_addrs(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let Some(first) = addrs.first() else {
+        return addrs;
+    };
+    let first_is_v6 = first.is_ipv6();
+    let (primary, secondary): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first_is_v6);
+    let mut out = Vec::with_capacity(primary.len() + secondary.len());
+    let mut primary = primary.into_iter();
+    let mut secondary = secondary.into_iter();
+    loop {
+        match (primary.next(), secondary.next()) {
+            (None, None) => break,
+            (a, b) => out.extend(a.into_iter().chain(b)),
         }
     }
-    Err(last_err.unwrap_or_else(|| timed_out(host, port, timeout)))
+    out
 }
+
+/// Dial `candidates` with RFC 8305 Happy Eyeballs: addresses are interleaved by family, the
+/// first attempt starts immediately, and each further attempt starts after
+/// [`HAPPY_EYEBALLS_DELAY`] (or at once when an in-flight attempt fails). The first
+/// socket to connect wins; all other attempts are aborted. Bounded by `deadline`.
+async fn connect_happy_eyeballs(
+    candidates: Vec<SocketAddr>,
+    deadline: Instant,
+    host: &str,
+    port: u16,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    let mut pending = interleave_addrs(candidates).into_iter();
+    let Some(first) = pending.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("no addresses to connect to for {host}"),
+        ));
+    };
+    // Dropping the JoinSet (on return) aborts every attempt still in flight.
+    let mut attempts = tokio::task::JoinSet::new();
+    attempts.spawn(TcpStream::connect(first));
+    let mut last_err: Option<io::Error> = None;
+    let overall = tokio::time::sleep_until(deadline);
+    tokio::pin!(overall);
+
+    loop {
+        let has_more = pending.len() > 0;
+        tokio::select! {
+            biased;
+            joined = attempts.join_next() => {
+                let result = match joined {
+                    Some(Ok(result)) => result,
+                    Some(Err(join_err)) => Err(io::Error::other(join_err)),
+                    None => Err(last_err
+                        .take()
+                        .unwrap_or_else(|| timed_out(host, port, timeout))),
+                };
+                match result {
+                    Ok(stream) => return Ok(stream),
+                    Err(e) => last_err = Some(e),
+                }
+                // A failed attempt advances to the next candidate immediately.
+                if let Some(addr) = pending.next() {
+                    attempts.spawn(TcpStream::connect(addr));
+                } else if attempts.is_empty() {
+                    return Err(last_err.unwrap_or_else(|| timed_out(host, port, timeout)));
+                }
+            }
+            () = tokio::time::sleep(HAPPY_EYEBALLS_DELAY), if has_more => {
+                if let Some(addr) = pending.next() {
+                    attempts.spawn(TcpStream::connect(addr));
+                }
+            }
+            () = &mut overall => return Err(timed_out(host, port, timeout)),
+        }
+    }
+}
+
+/// Per-direction buffer size used by [`relay_bidirectional`] (Tokio's default is 8 KiB).
+const RELAY_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Relay bytes in both directions until both sides reach EOF (or either side errors).
 ///
 /// Returns `(bytes_in, bytes_out)` where `bytes_in` is the number of bytes read from
 /// `client` and written to `upstream`, and `bytes_out` is the number of bytes read from
-/// `upstream` and written to `client`. Data is streamed through fixed buffers and never
-/// retained.
+/// `upstream` and written to `client`. Data is streamed through fixed 32 KiB buffers (one per
+/// direction) and never retained.
 pub async fn relay_bidirectional<C, U>(client: &mut C, upstream: &mut U) -> io::Result<(u64, u64)>
 where
     C: AsyncRead + AsyncWrite + Unpin + ?Sized,
     U: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
-    tokio::io::copy_bidirectional(client, upstream).await
+    tokio::io::copy_bidirectional_with_sizes(client, upstream, RELAY_BUFFER_SIZE, RELAY_BUFFER_SIZE)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -279,22 +372,33 @@ where
 pub struct PrefixedStream<S> {
     inner: S,
     buffer: Vec<u8>,
+    /// Read cursor into `buffer`: bytes before `pos` have already been replayed.
+    pos: usize,
 }
 
 impl<S> PrefixedStream<S> {
     /// Wrap `inner`, replaying any `buffer` bytes already read past a framing header.
     pub fn new(inner: S, buffer: Vec<u8>) -> Self {
-        Self { inner, buffer }
+        Self {
+            inner,
+            buffer,
+            pos: 0,
+        }
     }
 
     /// Number of buffered bytes still to be replayed.
     pub fn buffered(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.pos
     }
 
     /// Consume the wrapper, returning the inner stream and any remaining buffered bytes.
-    pub fn into_inner(self) -> (S, Vec<u8>) {
-        (self.inner, self.buffer)
+    pub fn into_inner(mut self) -> (S, Vec<u8>) {
+        let rest = if self.pos >= self.buffer.len() {
+            Vec::new()
+        } else {
+            self.buffer.split_off(self.pos)
+        };
+        (self.inner, rest)
     }
 }
 
@@ -305,12 +409,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if !this.buffer.is_empty() {
-            let unfilled = buf.initialize_unfilled();
-            let n = std::cmp::min(this.buffer.len(), unfilled.len());
-            unfilled[..n].copy_from_slice(&this.buffer[..n]);
-            buf.advance(n);
-            this.buffer.drain(..n);
+        let remaining = this.buffer.len() - this.pos;
+        if remaining > 0 {
+            let n = std::cmp::min(remaining, buf.remaining());
+            buf.put_slice(&this.buffer[this.pos..this.pos + n]);
+            this.pos += n;
+            if this.pos == this.buffer.len() {
+                this.buffer = Vec::new();
+                this.pos = 0;
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut this.inner).poll_read(cx, buf)
@@ -325,6 +432,19 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -399,6 +519,98 @@ mod tests {
         let stream = stream.unwrap();
         assert!(stream.nodelay().unwrap());
         accept.await.unwrap().unwrap();
+    }
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn interleave_addrs_alternates_families_starting_with_first() {
+        let input = vec![
+            sa("[2001:db8::1]:80"),
+            sa("[2001:db8::2]:80"),
+            sa("[2001:db8::3]:80"),
+            sa("192.0.2.1:80"),
+            sa("192.0.2.2:80"),
+        ];
+        assert_eq!(
+            interleave_addrs(input),
+            vec![
+                sa("[2001:db8::1]:80"),
+                sa("192.0.2.1:80"),
+                sa("[2001:db8::2]:80"),
+                sa("192.0.2.2:80"),
+                sa("[2001:db8::3]:80"),
+            ]
+        );
+
+        let v4_first = vec![
+            sa("192.0.2.1:80"),
+            sa("[2001:db8::1]:80"),
+            sa("192.0.2.2:80"),
+        ];
+        assert_eq!(
+            interleave_addrs(v4_first),
+            vec![
+                sa("192.0.2.1:80"),
+                sa("[2001:db8::1]:80"),
+                sa("192.0.2.2:80"),
+            ]
+        );
+    }
+
+    #[test]
+    fn interleave_addrs_handles_empty_and_single_family() {
+        assert!(interleave_addrs(Vec::new()).is_empty());
+        let v4 = vec![sa("192.0.2.1:80"), sa("192.0.2.2:80")];
+        assert_eq!(interleave_addrs(v4.clone()), v4);
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_skips_refused_candidate_quickly() {
+        let closed_port = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open_addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+        let stream = connect_happy_eyeballs(
+            vec![SocketAddr::new(open_addr.ip(), closed_port), open_addr],
+            started + timeout,
+            "127.0.0.1",
+            open_addr.port(),
+            timeout,
+        )
+        .await
+        .unwrap();
+        // A refused attempt advances immediately instead of waiting out the stagger delay.
+        assert!(started.elapsed() < HAPPY_EYEBALLS_DELAY);
+        assert_eq!(stream.peer_addr().unwrap(), open_addr);
+        accept.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn happy_eyeballs_reports_last_error_when_all_fail() {
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let timeout = Duration::from_secs(5);
+        let err = connect_happy_eyeballs(
+            vec![closed, closed],
+            Instant::now() + timeout,
+            "127.0.0.1",
+            closed.port(),
+            timeout,
+        )
+        .await
+        .unwrap_err();
+        assert_ne!(err.kind(), io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]
@@ -498,6 +710,39 @@ mod tests {
         ps.read_to_end(&mut out).await.unwrap();
         upstream_task.await.unwrap();
         assert_eq!(out, b"BODY");
+    }
+
+    #[tokio::test]
+    async fn prefixed_stream_partial_reads_track_cursor() {
+        let (inner, mut peer) = tokio::io::duplex(64);
+        let mut ps = PrefixedStream::new(inner, b"abcdef".to_vec());
+        assert_eq!(ps.buffered(), 6);
+
+        let mut two = [0u8; 2];
+        ps.read_exact(&mut two).await.unwrap();
+        assert_eq!(&two, b"ab");
+        assert_eq!(ps.buffered(), 4);
+
+        let mut three = [0u8; 3];
+        ps.read_exact(&mut three).await.unwrap();
+        assert_eq!(&three, b"cde");
+        assert_eq!(ps.buffered(), 1);
+
+        let (inner, rest) = ps.into_inner();
+        assert_eq!(rest, b"f");
+
+        // Drain the pushback fully, then the inner stream is read.
+        let mut ps = PrefixedStream::new(inner, rest);
+        peer.write_all(b"XY").await.unwrap();
+        let mut one = [0u8; 1];
+        ps.read_exact(&mut one).await.unwrap();
+        assert_eq!(&one, b"f");
+        assert_eq!(ps.buffered(), 0);
+        let mut xy = [0u8; 2];
+        ps.read_exact(&mut xy).await.unwrap();
+        assert_eq!(&xy, b"XY");
+        let (_inner, rest) = ps.into_inner();
+        assert!(rest.is_empty());
     }
 
     #[tokio::test]

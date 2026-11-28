@@ -72,7 +72,7 @@ impl UpstreamDialer for Socks5Dialer {
         Box::pin(async move {
             let request = encode_connect_request(&host, port)?;
             let upstream = self.redacted_upstream();
-            with_timeout(&format!("SOCKS5 upstream {upstream}"), timeout, async {
+            with_timeout(|| format!("SOCKS5 upstream {upstream}"), timeout, async {
                 let mut stream = connect_upstream_filtered(
                     &self.proxy_host,
                     self.proxy_port,

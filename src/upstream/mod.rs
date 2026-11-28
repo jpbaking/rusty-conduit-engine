@@ -28,9 +28,10 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -38,7 +39,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 
 use crate::filter::HostFilter;
-use crate::logging::Logger;
+use crate::logging::{log_debug, Logger};
 use crate::net::{KeepaliveSettings, PrefixedStream};
 use crate::router::ResolvedTarget;
 use crate::routing::{ProfileConfig, ProfileType, RoutingError, RoutingInput};
@@ -127,6 +128,28 @@ impl AsyncWrite for UpstreamStream {
             Self::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
             Self::Prefixed(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
             Self::Boxed(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Self::Tls(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Prefixed(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Boxed(s) => Pin::new(s.as_mut()).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tcp(s) => s.is_write_vectored(),
+            Self::Tls(s) => s.is_write_vectored(),
+            Self::Prefixed(s) => s.is_write_vectored(),
+            Self::Boxed(s) => s.is_write_vectored(),
         }
     }
 
@@ -292,15 +315,20 @@ pub(crate) fn auth_rejected(message: impl Into<String>) -> io::Error {
 }
 
 /// Bounds a dial future by `timeout`, mapping expiry to [`io::ErrorKind::TimedOut`].
-pub(crate) async fn with_timeout<F, T>(what: &str, timeout: Duration, fut: F) -> io::Result<T>
+///
+/// `what` describes the operation for the timeout error; it is evaluated only when the
+/// timeout expires, so successful dials allocate no error context.
+pub(crate) async fn with_timeout<W, F, T>(what: W, timeout: Duration, fut: F) -> io::Result<T>
 where
+    W: FnOnce() -> String,
     F: Future<Output = io::Result<T>>,
 {
     tokio::time::timeout(timeout, fut).await.map_err(|_| {
         io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "{what} timed out after {}",
+                "{} timed out after {}",
+                what(),
                 humantime::format_duration(timeout)
             ),
         )
@@ -461,10 +489,61 @@ pub fn dialer_for_profile(
     Ok(Some(dialer))
 }
 
-/// Dialers for every concrete profile, keyed by profile name.
-#[derive(Clone, Default)]
+/// Default passive failover cooldown: how long a profile that failed to connect is skipped
+/// by multi-target chains before it is probed again.
+pub const DEFAULT_FAILOVER_COOLDOWN: Duration = Duration::from_secs(3);
+
+/// Shared passive-health state: one failure timestamp per profile, in milliseconds since
+/// `epoch` (`0` = healthy). Holds no sockets, DNS answers, or other connection data.
+#[derive(Debug)]
+struct CooldownState {
+    epoch: Instant,
+    cooldown: Duration,
+}
+
+impl CooldownState {
+    fn new(cooldown: Duration) -> Self {
+        Self {
+            epoch: Instant::now(),
+            cooldown,
+        }
+    }
+
+    /// Milliseconds since `epoch`, never `0` (reserved for "healthy").
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    fn cooldown_ms(&self) -> u64 {
+        u64::try_from(self.cooldown.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// Whether a profile whose failure mark is `mark` is still cooling down at `now`.
+    fn cooling(&self, mark: u64, now: u64) -> bool {
+        mark != 0 && now.saturating_sub(mark) < self.cooldown_ms()
+    }
+}
+
+/// Dialers for every concrete profile, keyed by profile name, plus the per-profile passive
+/// failover cooldown shared by every [`FailoverDialer`] built from this registry (clones
+/// share it too).
+#[derive(Clone)]
 pub struct ProfileRegistry {
     dialers: BTreeMap<String, Arc<dyn UpstreamDialer>>,
+    health: BTreeMap<String, Arc<AtomicU64>>,
+    cooldown: Arc<CooldownState>,
+}
+
+impl Default for ProfileRegistry {
+    fn default() -> Self {
+        Self {
+            dialers: BTreeMap::new(),
+            health: BTreeMap::new(),
+            cooldown: Arc::new(CooldownState::new(DEFAULT_FAILOVER_COOLDOWN)),
+        }
+    }
 }
 
 impl fmt::Debug for ProfileRegistry {
@@ -481,13 +560,30 @@ impl ProfileRegistry {
         profiles: &BTreeMap<String, ProfileConfig>,
         opts: &DialerOptions,
     ) -> Result<Self, UpstreamError> {
-        let mut dialers = BTreeMap::new();
+        let mut reg = Self::default();
         for (name, profile) in profiles {
             if let Some(d) = dialer_for_profile(name, profile, opts)? {
-                dialers.insert(name.clone(), d);
+                reg.insert(name.clone(), d);
             }
         }
-        Ok(Self { dialers })
+        Ok(reg)
+    }
+
+    /// Set the passive failover cooldown (default [`DEFAULT_FAILOVER_COOLDOWN`]): after a
+    /// profile fails to connect, multi-target chains skip it for this long, then let one
+    /// connection probe it again. [`Duration::ZERO`] disables skipping. Resets all
+    /// recorded failures.
+    pub fn with_failover_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = Arc::new(CooldownState::new(cooldown));
+        for mark in self.health.values_mut() {
+            *mark = Arc::new(AtomicU64::new(0));
+        }
+        self
+    }
+
+    /// The passive failover cooldown applied by chains built from this registry.
+    pub fn failover_cooldown(&self) -> Duration {
+        self.cooldown.cooldown
     }
 
     /// Build from a validated [`RoutingInput`] (declared plus built-in profiles), using its
@@ -512,7 +608,10 @@ impl ProfileRegistry {
 
     /// Register (or replace) a dialer under `name`.
     pub fn insert(&mut self, name: impl Into<String>, dialer: Arc<dyn UpstreamDialer>) {
-        self.dialers.insert(name.into(), dialer);
+        let name = name.into();
+        self.health
+            .insert(name.clone(), Arc::new(AtomicU64::new(0)));
+        self.dialers.insert(name, dialer);
     }
 
     /// The dialer for `name`.
@@ -533,14 +632,21 @@ impl ProfileRegistry {
     /// A [`FailoverDialer`] over profile `names`, in order.
     pub fn chain<S: AsRef<str>>(&self, names: &[S]) -> Result<FailoverDialer, UpstreamError> {
         let mut entries = Vec::with_capacity(names.len());
+        let mut health = Vec::with_capacity(names.len());
         for name in names {
             let name = name.as_ref();
             let dialer = self
                 .get(name)
                 .ok_or_else(|| UpstreamError::UnknownProfile(name.to_string()))?;
             entries.push((name.to_string(), dialer.clone()));
+            health.push(self.health.get(name).cloned());
         }
-        Ok(FailoverDialer::new(entries))
+        let mut chain = FailoverDialer::new(entries);
+        if !self.cooldown.cooldown.is_zero() {
+            chain.health = health;
+            chain.cooldown = Some(self.cooldown.clone());
+        }
+        Ok(chain)
     }
 
     /// A [`FailoverDialer`] over a router decision's resolved targets (`profile` names).
@@ -555,10 +661,19 @@ impl ProfileRegistry {
 /// Each attempt is bounded by the dial timeout. A failure advances to the next entry
 /// (logged at `DEBUG`), except [`RouteBlocked`], which stops the chain immediately. Failover
 /// happens only while connecting: once a stream is returned the chain is done.
+///
+/// Chains built by [`ProfileRegistry::chain`] also apply the registry's passive failover
+/// cooldown: a profile whose dial failed (connect error or timeout, never [`RouteBlocked`]
+/// or access denial) is skipped by multi-target chains until the cooldown elapses; then a
+/// single connection claims the probe and a success clears the mark. Single-target chains
+/// never skip, and when every entry is cooling down all are still tried in order.
 #[derive(Clone)]
 pub struct FailoverDialer {
     entries: Vec<(String, Arc<dyn UpstreamDialer>)>,
     logger: Option<Logger>,
+    /// Per-entry failure marks (parallel to `entries`; empty when cooldown is off).
+    health: Vec<Option<Arc<AtomicU64>>>,
+    cooldown: Option<Arc<CooldownState>>,
 }
 
 impl fmt::Debug for FailoverDialer {
@@ -579,6 +694,49 @@ impl FailoverDialer {
         Self {
             entries,
             logger: None,
+            health: Vec::new(),
+            cooldown: None,
+        }
+    }
+
+    /// Failure mark and cooldown state for entry `i`, when passive cooldown applies.
+    fn mark(&self, i: usize) -> Option<(&AtomicU64, &CooldownState)> {
+        let state = self.cooldown.as_deref()?;
+        let mark = self.health.get(i)?.as_deref()?;
+        Some((mark, state))
+    }
+
+    /// Whether entry `i` should be skipped right now. Claims the probe slot (via
+    /// compare-exchange) when its cooldown has elapsed, so only one connection probes.
+    fn should_skip(&self, i: usize) -> bool {
+        if self.entries.len() <= 1 {
+            return false;
+        }
+        let Some((mark, state)) = self.mark(i) else {
+            return false;
+        };
+        let now = state.now_ms();
+        let seen = mark.load(Ordering::Acquire);
+        if seen == 0 {
+            return false;
+        }
+        if state.cooling(seen, now) {
+            // Skip only while some other entry is still available.
+            return (0..self.entries.len())
+                .filter(|&j| j != i)
+                .any(|j| match self.mark(j) {
+                    Some((m, _)) => !state.cooling(m.load(Ordering::Acquire), now),
+                    None => true,
+                });
+        }
+        // Cooldown elapsed: claim the probe; losers keep failing over.
+        mark.compare_exchange(seen, now, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    }
+
+    fn record(&self, i: usize, ok: bool) {
+        if let Some((mark, state)) = self.mark(i) {
+            mark.store(if ok { 0 } else { state.now_ms() }, Ordering::Release);
         }
     }
 
@@ -601,33 +759,60 @@ impl FailoverDialer {
     /// Dial `host:port` through the chain, returning the first successful stream plus which
     /// profile connected. When every entry fails, returns the last error with a summary.
     pub async fn dial(&self, host: &str, port: u16, timeout: Duration) -> io::Result<DialOutcome> {
-        let target = host_port(host, port);
         let mut failures = Vec::new();
         let mut last_err: Option<io::Error> = None;
-        for (attempt, (name, dialer)) in self.entries.iter().enumerate() {
+        let mut skipped = Vec::new();
+        let mut order: Vec<usize> = Vec::with_capacity(self.entries.len());
+        for i in 0..self.entries.len() {
+            if self.should_skip(i) {
+                if let Some(logger) = &self.logger {
+                    let (name, dialer) = &self.entries[i];
+                    log_debug!(
+                        logger,
+                        "failover: skipping profile={name} upstream={} target={} \
+                         (failed within cooldown)",
+                        dialer.redacted_upstream(),
+                        host_port(host, port)
+                    );
+                }
+                skipped.push(i);
+            } else {
+                order.push(i);
+            }
+        }
+        // Skipped entries stay a last resort, tried in order after every live one.
+        order.extend(skipped);
+        for attempt in order {
+            let (name, dialer) = &self.entries[attempt];
             let upstream = dialer.redacted_upstream();
             let result = with_timeout(
-                &format!("dial {target} via {upstream}"),
+                || format!("dial {} via {upstream}", host_port(host, port)),
                 timeout,
                 dialer.connect(host, port, timeout),
             )
             .await;
             match result {
                 Ok(stream) => {
+                    self.record(attempt, true);
                     return Ok(DialOutcome {
                         stream,
                         profile: name.clone(),
                         upstream,
                         attempt,
-                    })
+                    });
                 }
                 Err(e) if is_route_blocked(&e) => return Err(e),
                 Err(e) => {
+                    if !crate::filter::is_access_denied(&e) {
+                        self.record(attempt, false);
+                    }
                     if let Some(logger) = &self.logger {
-                        logger.debug(format!(
-                            "failover: profile={name} upstream={upstream} target={target} \
-                             attempt={attempt} error={e}"
-                        ));
+                        log_debug!(
+                            logger,
+                            "failover: profile={name} upstream={upstream} target={} \
+                             attempt={attempt} error={e}",
+                            host_port(host, port)
+                        );
                     }
                     failures.push(format!("{name}: {e}"));
                     last_err = Some(e);
@@ -640,8 +825,9 @@ impl FailoverDialer {
             Some(e) => io::Error::new(
                 e.kind(),
                 format!(
-                    "all {} upstream targets failed for {target}: {}",
+                    "all {} upstream targets failed for {}: {}",
                     failures.len(),
+                    host_port(host, port),
                     failures.join("; ")
                 ),
             ),
@@ -863,6 +1049,164 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+    }
+
+    /// Counts `connect` calls; fails with `ConnectionRefused` while `fail` is set.
+    struct CountingDialer {
+        fail: std::sync::atomic::AtomicBool,
+        calls: AtomicU64,
+    }
+
+    impl CountingDialer {
+        fn new(fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                fail: std::sync::atomic::AtomicBool::new(fail),
+                calls: AtomicU64::new(0),
+            })
+        }
+
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl UpstreamDialer for CountingDialer {
+        fn connect(&self, _host: &str, _port: u16, _timeout: Duration) -> DialFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self.fail.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if fail {
+                    return Err(io::Error::new(io::ErrorKind::ConnectionRefused, "down"));
+                }
+                let (near, _far) = tokio::io::duplex(8);
+                Ok(UpstreamStream::boxed(near))
+            })
+        }
+
+        fn redacted_upstream(&self) -> String {
+            "external:counting".to_string()
+        }
+    }
+
+    fn cooldown_registry(
+        cooldown: Duration,
+        dialers: &[(&str, Arc<CountingDialer>)],
+    ) -> ProfileRegistry {
+        let mut reg = ProfileRegistry::default().with_failover_cooldown(cooldown);
+        for (name, d) in dialers {
+            reg.insert(*name, d.clone() as Arc<dyn UpstreamDialer>);
+        }
+        reg
+    }
+
+    async fn dial_profile(reg: &ProfileRegistry, names: &[&str]) -> io::Result<DialOutcome> {
+        reg.chain(names)
+            .unwrap()
+            .dial("a.example", 80, Duration::from_secs(1))
+            .await
+    }
+
+    #[test]
+    fn failover_cooldown_defaults_to_three_seconds() {
+        assert_eq!(
+            ProfileRegistry::default().failover_cooldown(),
+            DEFAULT_FAILOVER_COOLDOWN
+        );
+        let reg =
+            ProfileRegistry::from_profiles(&BTreeMap::new(), &DialerOptions::default()).unwrap();
+        assert_eq!(reg.failover_cooldown(), Duration::from_secs(3));
+    }
+
+    #[tokio::test]
+    async fn failover_cooldown_skips_dead_primary() {
+        let (vpn, ssh) = (CountingDialer::new(true), CountingDialer::new(false));
+        let reg = cooldown_registry(
+            Duration::from_secs(60),
+            &[("vpn", vpn.clone()), ("ssh", ssh.clone())],
+        );
+        let out = dial_profile(&reg, &["vpn", "ssh"]).await.unwrap();
+        assert_eq!((out.profile.as_str(), out.attempt), ("ssh", 1));
+        assert_eq!(vpn.calls(), 1);
+        // During cooldown the dead primary is not dialed at all.
+        for _ in 0..3 {
+            let out = dial_profile(&reg, &["vpn", "ssh"]).await.unwrap();
+            assert_eq!(out.profile, "ssh");
+        }
+        assert_eq!((vpn.calls(), ssh.calls()), (1, 4));
+    }
+
+    #[tokio::test]
+    async fn failover_cooldown_probes_primary_after_expiry() {
+        let (vpn, ssh) = (CountingDialer::new(true), CountingDialer::new(false));
+        let reg = cooldown_registry(
+            Duration::from_millis(50),
+            &[("vpn", vpn.clone()), ("ssh", ssh.clone())],
+        );
+        assert_eq!(
+            dial_profile(&reg, &["vpn", "ssh"]).await.unwrap().profile,
+            "ssh"
+        );
+        assert_eq!(
+            dial_profile(&reg, &["vpn", "ssh"]).await.unwrap().profile,
+            "ssh"
+        );
+        assert_eq!(vpn.calls(), 1);
+        vpn.fail.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        // Cooldown elapsed: the primary is probed and recovers.
+        let out = dial_profile(&reg, &["vpn", "ssh"]).await.unwrap();
+        assert_eq!((out.profile.as_str(), out.attempt), ("vpn", 0));
+        assert_eq!(vpn.calls(), 2);
+        // Success cleared the mark: it stays primary immediately afterwards.
+        assert_eq!(
+            dial_profile(&reg, &["vpn", "ssh"]).await.unwrap().profile,
+            "vpn"
+        );
+        assert_eq!(vpn.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn failover_cooldown_never_skips_single_target() {
+        let vpn = CountingDialer::new(true);
+        let reg = cooldown_registry(Duration::from_secs(60), &[("vpn", vpn.clone())]);
+        for _ in 0..3 {
+            let err = dial_profile(&reg, &["vpn"]).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
+        }
+        assert_eq!(vpn.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn failover_cooldown_zero_disables_skipping() {
+        let (vpn, ssh) = (CountingDialer::new(true), CountingDialer::new(false));
+        let reg = cooldown_registry(
+            Duration::ZERO,
+            &[("vpn", vpn.clone()), ("ssh", ssh.clone())],
+        );
+        assert_eq!(reg.failover_cooldown(), Duration::ZERO);
+        for _ in 0..3 {
+            assert_eq!(
+                dial_profile(&reg, &["vpn", "ssh"]).await.unwrap().profile,
+                "ssh"
+            );
+        }
+        assert_eq!((vpn.calls(), ssh.calls()), (3, 3));
+    }
+
+    #[tokio::test]
+    async fn failover_cooldown_all_cooling_still_dials() {
+        let (vpn, ssh) = (CountingDialer::new(true), CountingDialer::new(true));
+        let reg = cooldown_registry(
+            Duration::from_secs(60),
+            &[("vpn", vpn.clone()), ("ssh", ssh.clone())],
+        );
+        assert!(dial_profile(&reg, &["vpn", "ssh"]).await.is_err());
+        assert_eq!((vpn.calls(), ssh.calls()), (1, 1));
+        // Both are cooling down: the chain still dials them in order.
+        ssh.fail.store(false, Ordering::SeqCst);
+        let out = dial_profile(&reg, &["vpn", "ssh"]).await.unwrap();
+        assert_eq!((out.profile.as_str(), out.attempt), ("ssh", 1));
+        assert_eq!((vpn.calls(), ssh.calls()), (2, 2));
     }
 
     #[tokio::test]

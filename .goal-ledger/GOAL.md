@@ -1,55 +1,65 @@
-# GOAL — Raise the engine listen backlog to 4096
+# GOAL — Optimization roadmap Phase 2 for rusty-conduit-engine
 
 ## Goal
-- Goal ID: 20261126-listen-backlog
-- Outcome: Every engine listener requests a listen backlog of 4096 instead of the 128 that `tokio::net::TcpListener::bind` (via mio/std) hard-codes, so the kernel's own cap (`net.core.somaxconn`, `kern.ipc.somaxconn`) decides the queue length, and the change is recorded in the divergence ledger.
-- Done when: the six CI checks in `## Execution` pass; `src/server.rs` binds through a helper that keeps `SO_REUSEADDR` on non-Windows and listens with `LISTEN_BACKLOG = 4096`; on Linux with `somaxconn >= 300` the new test queues all 300 connections before the first accept (the old backlog stops at 129, because Linux queues backlog + 1); `docs/DIVERGENCE-LEDGER.md` has the entry; no version bump and no tag (the release is a separate step the user approves).
+- Goal ID: 20261128-engine-optimization-phase2
+- Outcome: `rusty-conduit-engine` fixes MITM bypass domain normalization, HTTP/1.1 slowloris header timeouts, MITM H2 stream caps, and `drain_timeout` task aborts (`B-01`, `B-06`), and lands `TCP_NODELAY`, async DNS routing, MITM TLS session/ALPN reuse, Happy Eyeballs dialing, passive upstream failover cooldown, fast-path logging, and data-plane/`CertCache` optimizations (`P-03`–`P-08`, `P-10`), with full Divergence Ledger and DOX updates.
+- Done when: `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py` exits 0 and `docs/DIVERGENCE-LEDGER.md` and `DOX.md` document every observable change.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
-- Last completed phase: phase-0002
+- Last completed phase: phase-0006
 
 ## Execution
 - Execution mode: delegated
-- Planner tier: Claude Code (claude-opus-5-5)
-- Executor tier: agy --model gemini-4-neon-medium via the herdr-subagent skill
+- Planner tier: Antigravity CLI (Gemini 4 Neon Medium)
+- Executor tier: claude --model opus --effort medium via the herdr-subagent skill
 - Full verification: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py
 
 ## Git
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: main
-- Work branch: goal/20261126-listen-backlog
-- Baseline commit: 1b67956fe540c920a985a0b311b77e0b1c5629ed
-- Starting upstream at start: origin/main@1b67956fe540c920a985a0b311b77e0b1c5629ed
+- Work branch: goal/20261128-engine-optimization-phase2
+- Baseline commit: 2008ee84a5794009c4d73936cfbab7c545feb60b
+- Starting upstream at start: origin/main@2008ee84a5794009c4d73936cfbab7c545feb60b
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — Bind listeners with a 4096 backlog
-- [done] phase-0002 — Record the change in the divergence ledger and DOX
+- [done] phase-0001 — MITM bypass normalization, H2 stream caps/adaptive window, TLS session reuse, and host-scoped URL-rule check
+- [done] phase-0002 — Server TCP_NODELAY, HTTP/1.1 header-read timeout, and drain_timeout task abort
+- [done] phase-0003 — Happy Eyeballs dialing, 32 KiB relay, vectored writes, and PrefixedStream cursor
+- [done] phase-0004 — Async DNS resolution for resolve_dns routing rules and O(1) CertCache eviction
+- [done] phase-0005 — Passive upstream failover cooldown and single lazy-timeout dial wrapper
+- [done] phase-0006 — Fast-path logging, non-blocking AccessGuard::drop, single-buffer log encoding, and DOX/Divergence Ledger closeout
 
 ## Handoff
 - Current position: completed
 - Next role: planner
 - Next action: none
-- Last verified evidence: planner Gate D full verification on 484799e passed (fmt, clippy x2, tests 164 + 153 unit, PURE_RUST_CRYPTO_OK); phase-0002 executor: grep M section & M-01 in docs/DIVERGENCE-LEDGER.md, grep LISTEN_BACKLOG in DOX.md, git diff --exit-code -- src tests Cargo.toml Cargo.lock, cargo test --locked (164 unit + 4 integration) all passed
+- Last verified evidence: Full verification exited 0 (fmt, clippy default + no-default-features, cargo test 223 passed / no-default-features 211 passed, PURE_RUST_CRYPTO_OK)
 - Blockers: none
 
 ## Review
-- Reviewed by: planner (claude-opus-5-5)
-- Verification result: full verification passed on macOS arm64; the Linux-only backlog test compiles out here and first runs in CI
-- Diff reviewed: 1b67956..484799e (src/server.rs, DOX.md, docs/DIVERGENCE-LEDGER.md, ledger)
-- Findings: one, fixed in 6dbd36f: the backlog test's `> 128` bound also passed with the old backlog (Linux queues backlog + 1), so it now requires all 300; no version bump or tag in range
+- Reviewed by: Antigravity CLI (Gemini 4 Neon Medium), planner
+- Verification result: pass — cargo fmt --check, cargo clippy (default + --no-default-features, -D warnings), cargo test --locked (223 passed, 0 failed), cargo test --no-default-features --locked (211 passed, 0 failed), and python3 scripts/check-pure-rust-crypto.py (PURE_RUST_CRYPTO_OK) all exited 0
+- Diff reviewed: 2008ee84a5794009c4d73936cfbab7c545feb60b..c974b4e (29 files incl. ledger; zero scope drift; M-08..M-15 in docs/DIVERGENCE-LEDGER.md and DOX closeout verified)
+- Findings: none (branch is unpublished and clean; optional squash on acceptance is eligible)
 
 ## Log
-- created ledger with 2 phases; replaces the completed ledger 20261126-e5-cli-releases (kept in Git history)
-- user decision (CLI consistency goal): listen-backlog/somaxconn is its own engine goal; no releases yet
-- planner prototype (tokio 1.54.1, socket2 0.6): TcpSocket + set_reuseaddr + listen(4096) binds v4 and v6, keeps SO_REUSEADDR, still reports AddrInUse for a taken port; on macOS (kern.ipc.somaxconn=128) exactly 128 connections queue before accept
-- follow-up after this goal (separate, needs the user's go-ahead): `chore: release v0.4.0` + tag, then bump the pin in rusty-conduit, rusty-conduit-ssh, rusty-conduit-switch, and rusty-conduit-gui and document somaxconn tuning in their sizing guides
-- user approved the goal, the branch, and execution ("approved, create the branch, and go"); created goal/20261126-listen-backlog from main
-- delegated phase-0001 to the executor
-- phase-0001 completed by executor: bound listeners with LISTEN_BACKLOG = 4096 and added unit tests; full verification passed
-- planner review of phase-0001: accepted; tightened backlog_queues_more_than_128_connections from `> 128` to `== 300`, since Linux accepts backlog + 1 and the old code would have reached 129
-- delegated phase-0002 to the executor
-- phase-0002 completed by executor: recorded M-01 in docs/DIVERGENCE-LEDGER.md and updated DOX.md Feature Map; verification passed
-- Gate D passed; goal awaiting the user's acceptance
-- user accepted ("accept, squash, and push engine main"); squashed onto main as one commit; the per-phase history stays on goal/20261126-listen-backlog
+- created ledger with 6 phases (replaces completed 20261126-listen-backlog ledger upon Gate A approval)
+- source plan: ../docs/OPTIMIZATION.md, roadmap Phase 2 (items B-01, B-06, P-03, P-04, P-05, P-06, P-07, P-08, P-10)
+- invariants preserved: zero hidden data/DNS/connection caches (CertCache remains sole cache), pure-Rust crypto only, --no-default-features must build and pass tests
+- Gate A/B/C approved by user on 2026-11-28; created goal/20261128-engine-optimization-phase2 from main at 2008ee84a5794009c4d73936cfbab7c545feb60b
+- delegated phase-0001 to claude --model opus --effort medium via herdr-subagent
+- phase-0001 done by executor (claude opus): B-01 bypass normalization, H2 stream cap/adaptive window, shared TLS session storage/ticketer + UpstreamTlsPool, host-scoped URL-rule check; Verify passed
+- planner verified phase-0001; delegated phase-0002 to claude --model opus --effort medium via herdr-subagent
+- phase-0002 done by executor (claude opus): server TCP_NODELAY, HTTP/1.1 header-read timeout (30s default, `with_header_read_timeout`), drain_timeout aborts remaining connection tasks; Verify passed after one fmt fix-up
+- planner verified phase-0002; delegated phase-0003 to claude --model opus --effort medium via herdr-subagent
+- phase-0003 done by executor (claude opus): Happy Eyeballs dialing via JoinSet (no new deps), 32 KiB relay buffers, vectored-write forwarding on PrefixedStream/UpstreamStream/CountingStream, PrefixedStream read cursor; Verify passed
+- planner verified phase-0003; delegated phase-0004 to claude --model opus --effort medium via herdr-subagent
+- phase-0004 done by executor (claude opus): Router::needs_dns/route_with_ips, RouteResolver::resolve_with_ips + resolve_route_async (tokio lookup_host bounded by connect_timeout, no cache) wired into HTTP/MITM/SOCKS, CertCache FIFO O(1) eviction; Verify passed
+- planner verified phase-0004; delegated phase-0005 to claude --model opus --effort medium via herdr-subagent
+- phase-0005 done by executor (claude opus): lazy `with_timeout` error context, passive per-profile failover cooldown (DEFAULT_FAILOVER_COOLDOWN 3 s, `ProfileRegistry::with_failover_cooldown`, CAS probe claim, clear on success); Verify passed
+- planner verified phase-0005; delegated phase-0006 to claude --model opus --effort medium via herdr-subagent
+- phase-0006 done by executor (claude opus): log_*! macros + Logger::log_fmt on hot paths, single-buffer visitor encoder (byte-identical), AccessLogger::try_log_http + non-blocking AccessGuard::drop, record skipped when access logging off (HTTP, MITM, SOCKS), Divergence Ledger M-08..M-15 and DOX closeout; Verify passed
+- planner Gate D review passed: Full verification exited 0 (223 default tests, 211 --no-default-features tests, PURE_RUST_CRYPTO_OK), 29 files reviewed with zero scope drift; set Goal status to awaiting-acceptance
+- user accepted goal on 2026-11-28 and chose squash + merge into main; soft-reset to baseline 2008ee84a5794009c4d73936cfbab7c545feb60b, created single squashed commit retaining .goal-ledger/, and fast-forwarded main

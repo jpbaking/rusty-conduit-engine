@@ -11,7 +11,13 @@
 //! * An optional entry cap ([`CertCache::with_max_entries`]) is enforced on insert: expired
 //!   entries are reaped first, then the oldest live entries are evicted. Inserts are
 //!   serialized so the cap is strict; cache hits never take that lock.
+//! * Because `ttl` is fixed, insertion order is expiry order: a FIFO of `(seq, host)`
+//!   kept under the insert lock makes evicting the oldest entry amortized `O(1)`. Queue
+//!   items whose entry was replaced or removed are skipped and dropped lazily.
+//! * Lock order: `insert_lock` is always taken before any `DashMap` shard guard, and no
+//!   shard guard is ever held while taking `insert_lock`.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -40,6 +46,16 @@ struct CacheEntry {
     seq: u64,
 }
 
+/// Insert-side state, guarded by [`CertCache::insert_lock`].
+#[derive(Default)]
+struct InsertState {
+    /// Next insertion sequence number.
+    next_seq: u64,
+    /// `(seq, host)` of every insert, oldest first; may hold stale items whose entry was
+    /// since replaced (different `seq`) or removed.
+    order: VecDeque<(u64, String)>,
+}
+
 /// TTL-bounded leaf certificate cache with single-flight signing.
 pub struct CertCache {
     entries: DashMap<String, CacheEntry>,
@@ -48,8 +64,8 @@ pub struct CertCache {
     ttl: Duration,
     /// `0` means unlimited.
     max_entries: usize,
-    /// Serializes inserts and holds the next insertion sequence number.
-    insert_lock: Mutex<u64>,
+    /// Serializes inserts and holds the insertion sequence and FIFO eviction order.
+    insert_lock: Mutex<InsertState>,
     logger: OnceLock<Logger>,
 }
 
@@ -71,7 +87,7 @@ impl CertCache {
             source,
             ttl,
             max_entries: 0,
-            insert_lock: Mutex::new(0),
+            insert_lock: Mutex::new(InsertState::default()),
             logger: OnceLock::new(),
         }
     }
@@ -151,14 +167,14 @@ impl CertCache {
 
     /// Insert a leaf signed at `now`, making room first if the cache is at its cap.
     fn store_at(&self, host: &str, key: Arc<CertifiedKey>, now: Instant) {
-        let mut seq = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.max_entries > 0
             && !self.entries.contains_key(host)
             && self.entries.len() >= self.max_entries
         {
-            let reaped = self.reap_at(now);
+            let reaped = self.reap_locked(now, &mut state);
             let mut evicted = 0;
-            while self.entries.len() >= self.max_entries && self.evict_oldest() {
+            while self.entries.len() >= self.max_entries && self.evict_oldest(&mut state) {
                 evicted += 1;
             }
             if let Some(logger) = self.logger.get() {
@@ -168,25 +184,61 @@ impl CertCache {
                 ));
             }
         }
+        let seq = state.next_seq;
+        state.next_seq = seq.wrapping_add(1);
         self.entries.insert(
             host.to_string(),
             CacheEntry {
                 key,
                 expires_at: now + self.ttl,
-                seq: *seq,
+                seq,
             },
         );
-        *seq = seq.wrapping_add(1);
+        state.order.push_back((seq, host.to_string()));
+        // Drop queue items made stale by replacements or lazy-expiry removals.
+        self.prune_order(&mut state, None);
     }
 
-    /// Remove the entry with the earliest expiry; returns whether one was removed.
-    fn evict_oldest(&self) -> bool {
-        let oldest = self
-            .entries
-            .iter()
-            .min_by_key(|e| (e.expires_at, e.seq))
-            .map(|e| e.key().clone());
-        oldest.is_some_and(|host| self.entries.remove(&host).is_some())
+    /// Whether the queue item `(seq, host)` still names the stored entry for `host`.
+    fn is_live(&self, seq: u64, host: &str) -> bool {
+        self.entries.get(host).is_some_and(|e| e.seq == seq)
+    }
+
+    /// Pop stale items off the front of the eviction queue: entries that were replaced or
+    /// removed, and (with `expired_at`) entries expired at that instant, which are removed.
+    /// Stops at the first live, unexpired entry.
+    fn prune_order(&self, state: &mut InsertState, expired_at: Option<Instant>) {
+        while let Some((seq, host)) = state.order.front() {
+            let expires_at = match self.entries.get(host.as_str()) {
+                Some(e) if e.seq == *seq => e.expires_at,
+                _ => {
+                    state.order.pop_front();
+                    continue;
+                }
+            };
+            match expired_at {
+                Some(now) if now >= expires_at => {
+                    let seq = *seq;
+                    self.entries
+                        .remove_if(host.as_str(), |_, e| e.seq == seq && now >= e.expires_at);
+                    state.order.pop_front();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Remove the oldest live entry (earliest expiry, then insertion order) in amortized
+    /// `O(1)`; returns whether one was removed.
+    fn evict_oldest(&self, state: &mut InsertState) -> bool {
+        while let Some((seq, host)) = state.order.pop_front() {
+            if self.is_live(seq, &host)
+                && self.entries.remove_if(&host, |_, e| e.seq == seq).is_some()
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Lazy-expiry read: an entry with `now >= expires_at` is removed and reported as a miss.
@@ -203,8 +255,15 @@ impl CertCache {
 
     /// Remove every entry expired at `now`; returns the number evicted.
     pub fn reap_at(&self, now: Instant) -> usize {
+        let mut state = self.insert_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.reap_locked(now, &mut state)
+    }
+
+    /// [`Self::reap_at`] with `insert_lock` already held; also prunes the eviction queue.
+    fn reap_locked(&self, now: Instant, state: &mut InsertState) -> usize {
         let before = self.entries.len();
         self.entries.retain(|_, e| now < e.expires_at);
+        self.prune_order(state, Some(now));
         before.saturating_sub(self.entries.len())
     }
 
@@ -463,6 +522,47 @@ mod tests {
         store(&cache, &src, "a.example", t0 + Duration::from_secs(2));
         assert_eq!(cache.len(), 2);
         assert!(cache.entries.contains_key("b.example"));
+    }
+
+    #[test]
+    fn cap_evicts_in_insertion_order_after_reinsertion() {
+        let (src, cache) = capped(3);
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        store(&cache, &src, "a.example", at(0));
+        store(&cache, &src, "b.example", at(1));
+        store(&cache, &src, "c.example", at(2));
+        // Re-inserting `a` makes it the newest; its old queue item becomes stale.
+        store(&cache, &src, "a.example", at(3));
+        assert_eq!(cache.len(), 3);
+        store(&cache, &src, "d.example", at(4));
+        assert!(!cache.entries.contains_key("b.example"));
+        store(&cache, &src, "e.example", at(5));
+        assert!(!cache.entries.contains_key("c.example"));
+        store(&cache, &src, "f.example", at(6));
+        assert!(!cache.entries.contains_key("a.example"));
+        for host in ["d.example", "e.example", "f.example"] {
+            assert!(cache.entries.contains_key(host), "{host}");
+        }
+        assert_eq!(cache.len(), 3);
+        // Stale items never pile up: the queue tracks only stored entries.
+        let order_len = cache.insert_lock.lock().unwrap().order.len();
+        assert_eq!(order_len, 3);
+    }
+
+    #[test]
+    fn reinserts_and_reaps_keep_the_queue_bounded() {
+        let src = counting(Duration::ZERO);
+        let cache = CertCache::new(src.clone(), Duration::from_secs(60));
+        let t0 = Instant::now();
+        for i in 0..100 {
+            store(&cache, &src, "same.example", t0 + Duration::from_secs(i));
+        }
+        assert_eq!(cache.insert_lock.lock().unwrap().order.len(), 1);
+        store(&cache, &src, "other.example", t0 + Duration::from_secs(100));
+        assert_eq!(cache.reap_at(t0 + Duration::from_secs(200)), 2);
+        assert!(cache.insert_lock.lock().unwrap().order.is_empty());
+        assert!(cache.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

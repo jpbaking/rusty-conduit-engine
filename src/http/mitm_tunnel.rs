@@ -78,12 +78,12 @@ use super::{
     dial_error_status, AccessGuard, ConnectTarget, CountingBody, ErrorPageTemplate, ProxyBody,
 };
 use crate::filter::FilterRule;
-use crate::logging::{AccessLogger, HttpAccessRecord, Logger};
+use crate::logging::{log_debug, AccessLogger, HttpAccessRecord, Logger};
 use crate::mitm::cache::CertCache;
 use crate::mitm::UpstreamTlsVerification;
 use crate::net::relay_bidirectional;
 use crate::router::{RouteDecision, RouteRequest};
-use crate::routing::Inbound;
+use crate::routing::{resolve_route_async, Inbound};
 use crate::routing::{RouteResolver, RoutingCounters};
 use crate::server::RoutingState;
 use crate::upstream::UpstreamStream;
@@ -97,6 +97,8 @@ pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// `content-security-policy` and `set-cookie` headers), so a stricter proxy would fail
 /// pages a browser loads directly.
 pub const H2_MAX_HEADER_LIST_SIZE: u32 = 256 * 1024;
+/// Most concurrent HTTP/2 streams a decrypted MITM client connection may open.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 
 const ALPN_H2: &[u8] = b"h2";
 const ALPN_HTTP11: &[u8] = b"http/1.1";
@@ -328,8 +330,12 @@ pub(crate) struct MitmConnect {
 #[derive(Clone)]
 pub struct MitmInterceptor {
     cache: Arc<CertCache>,
-    upstream_tls: Arc<ClientConfig>,
+    upstream_tls: UpstreamTlsPool,
     provider: Arc<CryptoProvider>,
+    /// TLS session cache and ticketer shared by every intercepted client connection, so
+    /// clients can resume sessions across `CONNECT`s.
+    session_storage: Arc<dyn rustls::server::StoresServerSessions>,
+    ticketer: Option<Arc<dyn rustls::server::ProducesTickets>>,
     error_page: Option<ErrorPageTemplate>,
     bypass_hosts: Arc<[FilterRule]>,
 }
@@ -373,10 +379,57 @@ struct DialFailure {
     info: RouteInfo,
 }
 
+/// Size of the server-side TLS session cache shared by all intercepted connections.
+const SERVER_SESSION_CACHE_SIZE: usize = 4096;
+
+/// The upstream `ClientConfig` pre-built for each common ALPN offer, so a dial does not
+/// clone the config. Every variant shares the base config's client session store.
+#[derive(Clone)]
+struct UpstreamTlsPool {
+    base: Arc<ClientConfig>,
+    none: Arc<ClientConfig>,
+    h11: Arc<ClientConfig>,
+    h2: Arc<ClientConfig>,
+    h2_h11: Arc<ClientConfig>,
+}
+
+impl UpstreamTlsPool {
+    fn new(base: Arc<ClientConfig>) -> Self {
+        let with = |alpn: &[&[u8]]| {
+            let mut cfg = (*base).clone();
+            cfg.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+            Arc::new(cfg)
+        };
+        Self {
+            none: with(&[]),
+            h11: with(&[ALPN_HTTP11]),
+            h2: with(&[ALPN_H2]),
+            h2_h11: with(&[ALPN_H2, ALPN_HTTP11]),
+            base,
+        }
+    }
+
+    /// The config offering exactly `alpn`, in order; uncommon offers get a fresh one.
+    fn get(&self, alpn: Vec<Vec<u8>>) -> Arc<ClientConfig> {
+        let pre_built = match alpn.as_slice() {
+            [] => &self.none,
+            [p] if p == ALPN_HTTP11 => &self.h11,
+            [p] if p == ALPN_H2 => &self.h2,
+            [a, b] if a == ALPN_H2 && b == ALPN_HTTP11 => &self.h2_h11,
+            _ => {
+                let mut cfg = (*self.base).clone();
+                cfg.alpn_protocols = alpn;
+                return Arc::new(cfg);
+            }
+        };
+        Arc::clone(pre_built)
+    }
+}
+
 /// Opens upstream TLS connections to the `CONNECT` target through routed upstream chains.
 #[derive(Clone)]
 struct Dialer {
-    tls: Arc<ClientConfig>,
+    tls: UpstreamTlsPool,
     target: ConnectTarget,
     server_name: ServerName<'static>,
     /// Pinned resolver deciding routes; [`Self::state`] is its dialing snapshot.
@@ -397,7 +450,7 @@ fn chain_key(d: &RouteDecision) -> String {
 
 impl Dialer {
     /// Route the target, optionally with the full decrypted request URL.
-    fn route(&self, url: Option<&str>) -> Result<RouteDecision, DialFailure> {
+    async fn route(&self, url: Option<&str>) -> Result<RouteDecision, DialFailure> {
         let req = RouteRequest {
             inbound: Inbound::Http,
             host: &self.target.host,
@@ -405,16 +458,18 @@ impl Dialer {
             scheme: Some("https"),
             url,
         };
-        self.route.resolve(&req).map_err(|denied| {
-            self.logger.info(format!(
-                "MITM {} denied by filter: {denied}",
-                url.unwrap_or(&self.target.authority())
-            ));
-            DialFailure {
-                status: StatusCode::FORBIDDEN,
-                info: RouteInfo::default(),
-            }
-        })
+        resolve_route_async(self.route.as_ref(), &req, self.state.connect_timeout)
+            .await
+            .map_err(|denied| {
+                self.logger.info(format!(
+                    "MITM {} denied by filter: {denied}",
+                    url.unwrap_or(&self.target.authority())
+                ));
+                DialFailure {
+                    status: StatusCode::FORBIDDEN,
+                    info: RouteInfo::default(),
+                }
+            })
     }
 
     /// Dial `decision`'s failover chain to the target and run upstream TLS over the stream.
@@ -480,9 +535,7 @@ impl Dialer {
             counters: Some(self.state.counters.clone()),
             counted_profile: RoutingState::counted_profile(decision, Some(outcome.attempt)),
         };
-        let mut cfg = (*self.tls).clone();
-        cfg.alpn_protocols = alpn;
-        let connector = TlsConnector::from(Arc::new(cfg));
+        let connector = TlsConnector::from(self.tls.get(alpn));
         let tls = tokio::time::timeout(
             TLS_HANDSHAKE_TIMEOUT,
             connector.connect(self.server_name.clone(), outcome.stream),
@@ -496,10 +549,13 @@ impl Dialer {
         });
         match tls {
             Ok(tls) => {
-                self.logger.debug(format!(
+                log_debug!(
+                    self.logger,
                     "MITM upstream {target}: rule={} profile={} upstream={}",
-                    info.rule, info.profile, info.upstream
-                ));
+                    info.rule,
+                    info.profile,
+                    info.upstream
+                );
                 Ok((tls, info))
             }
             Err(e) => {
@@ -602,8 +658,12 @@ impl MitmInterceptor {
     ) -> Self {
         Self {
             cache,
-            upstream_tls,
+            upstream_tls: UpstreamTlsPool::new(upstream_tls),
             provider,
+            session_storage: rustls::server::ServerSessionMemoryCache::new(
+                SERVER_SESSION_CACHE_SIZE,
+            ),
+            ticketer: rustls::crypto::ring::Ticketer::new().ok(),
             error_page: None,
             bypass_hosts: Arc::from([]),
         }
@@ -629,7 +689,10 @@ impl MitmInterceptor {
         if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
             self.bypass_hosts.iter().any(|r| r.matches_ip(ip))
         } else {
-            self.bypass_hosts.iter().any(|r| r.matches_domain(trimmed))
+            let normalized = crate::filter::normalize_domain(trimmed);
+            self.bypass_hosts
+                .iter()
+                .any(|r| r.matches_domain(&normalized))
         }
     }
 
@@ -674,11 +737,11 @@ impl MitmInterceptor {
             res = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor) => match res {
                 Ok(Ok(start)) => start,
                 Ok(Err(e)) => {
-                    logger.debug(format!("MITM {client} -> {target}: invalid ClientHello: {e}"));
+                    log_debug!(logger, "MITM {client} -> {target}: invalid ClientHello: {e}");
                     return;
                 }
                 Err(_) => {
-                    logger.debug(format!("MITM {client} -> {target}: ClientHello timed out"));
+                    log_debug!(logger, "MITM {client} -> {target}: ClientHello timed out");
                     return;
                 }
             },
@@ -697,18 +760,22 @@ impl MitmInterceptor {
         let leaf_host = sni.unwrap_or_else(|| target.host.clone());
 
         let Ok(server_name) = ServerName::try_from(leaf_host.clone()) else {
-            logger.debug(format!(
+            log_debug!(
+                logger,
                 "MITM {client} -> {target}: invalid server name {leaf_host:?}"
-            ));
+            );
             drop(connect_guard(
                 StatusCode::BAD_REQUEST,
                 &RouteInfo::default(),
             ));
             return;
         };
-        let per_request = state.router.has_url_rules(Inbound::Http);
+        let per_request =
+            state
+                .router
+                .host_may_match_url_rules(Inbound::Http, &target.host, target.port);
         let dialer = Dialer {
-            tls: Arc::clone(&self.upstream_tls),
+            tls: self.upstream_tls.clone(),
             target: target.clone(),
             server_name,
             route,
@@ -722,7 +789,7 @@ impl MitmInterceptor {
             (Routing::PerRequest(live), None, alpn)
         } else {
             let dialed = async {
-                let decision = dialer.route(None)?;
+                let decision = dialer.route(None).await?;
                 let (tls, info) = dialer.connect(&decision, offered.clone()).await?;
                 Ok::<_, DialFailure>((decision, tls, info))
             };
@@ -772,6 +839,10 @@ impl MitmInterceptor {
             }
         };
         server_cfg.alpn_protocols = negotiated.iter().cloned().collect();
+        server_cfg.session_storage = Arc::clone(&self.session_storage);
+        if let Some(ticketer) = &self.ticketer {
+            server_cfg.ticketer = Arc::clone(ticketer);
+        }
         let client_tls = tokio::select! {
             () = shutdown.cancelled() => return,
             res = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, start.into_stream(Arc::new(server_cfg))) => res,
@@ -779,13 +850,14 @@ impl MitmInterceptor {
         let client_tls = match client_tls {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
-                logger.debug(format!(
+                log_debug!(
+                    logger,
                     "MITM client TLS handshake with {client} for {leaf_host} failed: {e}"
-                ));
+                );
                 return;
             }
             Err(_) => {
-                logger.debug(format!("MITM client TLS handshake with {client} timed out"));
+                log_debug!(logger, "MITM client TLS handshake with {client} timed out");
                 return;
             }
         };
@@ -819,7 +891,7 @@ impl MitmInterceptor {
             (up, _) => session.serve_h1(client_tls, up).await,
         };
         if let Err(e) = result {
-            logger.debug(format!("MITM session {client} -> {target} ended: {e}"));
+            log_debug!(logger, "MITM session {client} -> {target} ended: {e}");
         }
         tasks.close();
         tasks.wait().await;
@@ -841,6 +913,9 @@ fn new_guard(
     method: &str,
     target: String,
 ) -> AccessGuard {
+    if !access.http_enabled() {
+        return AccessGuard::untracked(access.clone(), tasks.clone());
+    }
     AccessGuard::new(
         access.clone(),
         tasks.clone(),
@@ -920,7 +995,7 @@ impl Session {
             tokio::select! {
                 res = conn => {
                     if let Err(e) = res {
-                        logger.debug(format!("MITM upstream {what} connection error: {e}"));
+                        log_debug!(logger, "MITM upstream {what} connection error: {e}");
                     }
                 }
                 () = shutdown.cancelled() => {}
@@ -936,7 +1011,7 @@ impl Session {
 
     /// The decision for one decrypted request (`url` is its full `https://` URL) and the
     /// dialer bound to the snapshot it was made with.
-    fn decide(&self, url: &str) -> Result<(Arc<RouteDecision>, Dialer), DialFailure> {
+    async fn decide(&self, url: &str) -> Result<(Arc<RouteDecision>, Dialer), DialFailure> {
         match &self.routing {
             Routing::Fixed { decision, .. } => Ok((Arc::clone(decision), self.dialer.clone())),
             Routing::PerRequest(live) => {
@@ -946,7 +1021,7 @@ impl Session {
                     route,
                     ..self.dialer.clone()
                 };
-                let decision = dialer.route(Some(url))?;
+                let decision = dialer.route(Some(url)).await?;
                 Ok((Arc::new(decision), dialer))
             }
         }
@@ -1027,7 +1102,7 @@ impl Session {
     ) -> Response<ProxyBody> {
         let (authority, url) = self.request_target(&req);
         let mut guard = self.guard(req.method().as_str(), url.clone());
-        let (decision, dialer) = match self.decide(&url) {
+        let (decision, dialer) = match self.decide(&url).await {
             Ok(d) => d,
             Err(f) => {
                 guard.set_status(f.status);
@@ -1131,7 +1206,7 @@ impl Session {
             let (client, upstream) = match tokio::try_join!(client, upstream) {
                 Ok(pair) => pair,
                 Err(e) => {
-                    logger.debug(format!("MITM upgrade for {peer} failed: {e}"));
+                    log_debug!(logger, "MITM upgrade for {peer} failed: {e}");
                     return;
                 }
             };
@@ -1141,7 +1216,7 @@ impl Session {
             tokio::select! {
                 res = relay_bidirectional(&mut client, &mut upstream) => {
                     if let Err(e) = res {
-                        logger.debug(format!("MITM upgraded stream for {peer} ended: {e}"));
+                        log_debug!(logger, "MITM upgraded stream for {peer} ended: {e}");
                     }
                 }
                 () = shutdown.cancelled() => {}
@@ -1177,6 +1252,8 @@ impl Session {
         });
         let conn = server_http2::Builder::new(TokioExecutor::new())
             .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
+            .max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)
+            .adaptive_window(true)
             .serve_connection(TokioIo::new(client_tls), service);
         let mut conn = std::pin::pin!(conn);
         tokio::select! {
@@ -1191,6 +1268,7 @@ impl Session {
     async fn h2_handshake(&self, tls: UpstreamTls) -> Result<H2Sender, hyper::Error> {
         let (sender, conn) = client_http2::Builder::new(TokioExecutor::new())
             .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
+            .adaptive_window(true)
             .handshake(TokioIo::new(tls))
             .await?;
         self.spawn_driver("HTTP/2", conn);
@@ -1226,9 +1304,10 @@ impl Session {
         }
         // Dial while holding the slot, so concurrent requests share the new connection.
         let target = &self.dialer.target;
-        self.logger.debug(format!(
+        log_debug!(
+            self.logger,
             "MITM upstream HTTP/2 connection to {target} closed; redialing"
-        ));
+        );
         let (tls, info) = self
             .dialer
             .connect(
@@ -1363,10 +1442,11 @@ impl Session {
             });
             match again {
                 Some(r) if !resent => {
-                    self.logger.debug(format!(
+                    log_debug!(
+                        self.logger,
                         "MITM upstream HTTP/2 connection to {authority} closed before \
                          answering; resending on a new connection"
-                    ));
+                    );
                     resent = true;
                     request = r;
                 }
@@ -1550,6 +1630,94 @@ mod tests {
         assert_eq!(chain_key(&a), "corp,direct");
         assert_eq!(chain_key(&a), chain_key(&b));
         assert_ne!(chain_key(&a), chain_key(&c));
+    }
+
+    /// A certificate source for tests that never sign.
+    struct NoSign;
+
+    impl crate::mitm::signer::CertSource for NoSign {
+        fn sign(&self, host: &str) -> Result<Arc<CertifiedKey>, crate::mitm::signer::SignError> {
+            unreachable!("unexpected signing request for {host}")
+        }
+    }
+
+    fn bypass_interceptor(hosts: &[&str]) -> MitmInterceptor {
+        let provider = crate::mitm::crypto_provider();
+        let cache = Arc::new(CertCache::new(Arc::new(NoSign), Duration::from_secs(60)));
+        let upstream = Arc::new(
+            upstream_client_config(Arc::clone(&provider), &UpstreamTlsVerification::InsecureAll)
+                .unwrap(),
+        );
+        MitmInterceptor::new(cache, upstream, provider).with_bypass_hosts(
+            hosts
+                .iter()
+                .map(|r| r.parse::<FilterRule>().unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn should_bypass_normalizes_case_and_trailing_dot() {
+        let mitm = bypass_interceptor(&["example.com", "*.wild.test", "10.0.0.0/8"]);
+        for host in [
+            "example.com",
+            "Example.COM",
+            "example.com.",
+            "EXAMPLE.COM.",
+            "a.Wild.TEST.",
+            "10.1.2.3",
+            "[10.1.2.3]",
+        ] {
+            assert!(mitm.should_bypass(host), "{host} must bypass");
+        }
+        for host in ["other.com", "wild.test", "example.com..", "11.0.0.1"] {
+            assert!(!mitm.should_bypass(host), "{host} must not bypass");
+        }
+        // Rules written in uppercase or with a trailing dot match too.
+        let mitm = bypass_interceptor(&["Example.COM", "example.org."]);
+        for host in ["example.com", "EXAMPLE.com.", "example.org", "Example.Org."] {
+            assert!(mitm.should_bypass(host), "{host} must bypass");
+        }
+    }
+
+    #[test]
+    fn upstream_tls_pool_reuses_common_alpn_configs() {
+        let base = Arc::new(
+            upstream_client_config(
+                crate::mitm::crypto_provider(),
+                &UpstreamTlsVerification::InsecureAll,
+            )
+            .unwrap(),
+        );
+        let pool = UpstreamTlsPool::new(base);
+        let h2 = ALPN_H2.to_vec();
+        let h11 = ALPN_HTTP11.to_vec();
+        for alpn in [
+            vec![],
+            vec![h11.clone()],
+            vec![h2.clone()],
+            vec![h2.clone(), h11.clone()],
+        ] {
+            let a = pool.get(alpn.clone());
+            assert_eq!(a.alpn_protocols, alpn);
+            assert!(
+                Arc::ptr_eq(&a, &pool.get(alpn)),
+                "must reuse a pre-built config"
+            );
+        }
+        let reversed = vec![h11.clone(), h2.clone()];
+        let cfg = pool.get(reversed.clone());
+        assert_eq!(cfg.alpn_protocols, reversed);
+    }
+
+    #[test]
+    fn interceptor_shares_server_session_storage_and_ticketer() {
+        let mitm = bypass_interceptor(&[]);
+        let clone = mitm.clone();
+        assert!(Arc::ptr_eq(&mitm.session_storage, &clone.session_storage));
+        let ticketer = mitm.ticketer.as_ref().expect("ring ticketer available");
+        assert!(ticketer.enabled());
+        assert!(Arc::ptr_eq(ticketer, clone.ticketer.as_ref().unwrap()));
     }
 
     #[test]

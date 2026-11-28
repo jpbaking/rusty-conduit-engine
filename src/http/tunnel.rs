@@ -23,9 +23,10 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use super::{
     connect_established, dial_error_status, failed_route, ConnectTarget, ProxyBody, RequestCtx,
 };
+use crate::logging::log_debug;
 use crate::net::relay_bidirectional;
 use crate::router::{RouteDecision, RouteRequest};
-use crate::routing::{Inbound, RoutingState};
+use crate::routing::{resolve_route_async, Inbound, RoutingState};
 
 /// Handle a `CONNECT` request without interception.
 pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response<ProxyBody> {
@@ -39,10 +40,11 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
     let Some(target) = ConnectTarget::parse(&authority) else {
         let mut guard = ctx.access_guard("https", false, "CONNECT", authority.clone());
         guard.set_status(StatusCode::BAD_REQUEST);
-        logger.debug(format!(
+        log_debug!(
+            logger,
             "rejected CONNECT from {}: invalid target {authority:?}",
             ctx.peer
-        ));
+        );
         return ctx.error(
             StatusCode::BAD_REQUEST,
             "CONNECT target must be host:port",
@@ -58,7 +60,13 @@ pub(crate) async fn handle(ctx: &RequestCtx, req: Request<Incoming>) -> Response
         scheme: Some("https"),
         url: None,
     };
-    let decision = match ctx.route.resolve(&route_req) {
+    let decision = match resolve_route_async(
+        ctx.route.as_ref(),
+        &route_req,
+        ctx.state.connect_timeout,
+    )
+    .await
+    {
         Ok(d) => d,
         Err(denied) => {
             let mut guard = ctx.access_guard("https", false, "CONNECT", authority);
@@ -140,10 +148,12 @@ pub(crate) async fn handle_resolved(
         .get(outcome.attempt)
         .map(|t| t.label())
         .unwrap_or_else(|| outcome.profile.clone());
-    logger.debug(format!(
+    log_debug!(
+        logger,
         "CONNECT {target} from {}: rule={rule} profile={profile} upstream={}",
-        ctx.peer, outcome.upstream
-    ));
+        ctx.peer,
+        outcome.upstream
+    );
     guard.track(
         &state.counters,
         &rule,
@@ -159,7 +169,7 @@ pub(crate) async fn handle_resolved(
         let upgraded = match hyper::upgrade::on(req).await {
             Ok(u) => u,
             Err(e) => {
-                logger.debug(format!("CONNECT upgrade from {peer} failed: {e}"));
+                log_debug!(logger, "CONNECT upgrade from {peer} failed: {e}");
                 return;
             }
         };
@@ -168,11 +178,11 @@ pub(crate) async fn handle_resolved(
         tokio::select! {
             res = relay_bidirectional(&mut client, &mut upstream) => {
                 if let Err(e) = res {
-                    logger.debug(format!("CONNECT tunnel {peer} -> {target} ended: {e}"));
+                    log_debug!(logger, "CONNECT tunnel {peer} -> {target} ended: {e}");
                 }
             }
             () = shutdown.cancelled() => {
-                logger.debug(format!("CONNECT tunnel {peer} -> {target} closed by shutdown"));
+                log_debug!(logger, "CONNECT tunnel {peer} -> {target} closed by shutdown");
             }
         }
         drop(guard);
@@ -221,6 +231,20 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
         let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
         self.written.fetch_add(n as u64, Ordering::Relaxed);
         Poll::Ready(Ok(n))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let n = ready!(Pin::new(&mut self.inner).poll_write_vectored(cx, bufs))?;
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+        Poll::Ready(Ok(n))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

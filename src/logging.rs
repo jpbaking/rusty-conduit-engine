@@ -13,7 +13,7 @@
 //! Every access/SOCKS record carries routing visibility: `rule`, `profile`, and a redacted
 //! `upstream` (credentials are never emitted).
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -208,11 +208,62 @@ impl Logger {
         self.log(LogLevel::Verbose, msg);
     }
 
+    /// Write pre-built [`fmt::Arguments`] at `level` (no intermediate `String`). Pair with
+    /// the crate's `log_*!` macros, which skip building the arguments when `level` is off.
+    pub fn log_fmt(&self, level: LogLevel, args: fmt::Arguments<'_>) {
+        self.log(level, args);
+    }
+
     pub fn flush(&self) {
         let mut out = self.out.lock().unwrap_or_else(|e| e.into_inner());
         let _ = out.flush();
     }
 }
+
+/// Shared body of the `log_*!` macros: checks the level before evaluating the format
+/// arguments, so a disabled message costs one comparison and no allocation.
+macro_rules! log_at {
+    ($level:expr, $logger:expr, $($arg:tt)+) => {{
+        let logger: &$crate::logging::Logger = &$logger;
+        let level = $level;
+        if logger.enabled(level) {
+            logger.log_fmt(level, ::std::format_args!($($arg)+));
+        }
+    }};
+}
+
+/// `log_error!(logger, "fmt", args...)` — level-checked `ERROR` diagnostic.
+#[allow(unused_macros)]
+macro_rules! log_error {
+    ($logger:expr, $($arg:tt)+) => {
+        $crate::logging::log_at!($crate::logging::LogLevel::Error, $logger, $($arg)+)
+    };
+}
+
+/// `log_info!(logger, "fmt", args...)` — level-checked `INFO` diagnostic.
+#[allow(unused_macros)]
+macro_rules! log_info {
+    ($logger:expr, $($arg:tt)+) => {
+        $crate::logging::log_at!($crate::logging::LogLevel::Info, $logger, $($arg)+)
+    };
+}
+
+/// `log_debug!(logger, "fmt", args...)` — level-checked `DEBUG` diagnostic.
+macro_rules! log_debug {
+    ($logger:expr, $($arg:tt)+) => {
+        $crate::logging::log_at!($crate::logging::LogLevel::Debug, $logger, $($arg)+)
+    };
+}
+
+/// `log_verbose!(logger, "fmt", args...)` — level-checked `VERBOSE` diagnostic.
+macro_rules! log_verbose {
+    ($logger:expr, $($arg:tt)+) => {
+        $crate::logging::log_at!($crate::logging::LogLevel::Verbose, $logger, $($arg)+)
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use {log_at, log_debug, log_error, log_info, log_verbose};
 
 // ---------------------------------------------------------------------------
 // Access records
@@ -371,100 +422,119 @@ impl AccessRecord {
 pub type AccessRecordSink = Arc<dyn Fn(&AccessRecord) + Send + Sync>;
 
 /// A single field value, shared by the text and JSON encoders so both carry identical fields.
+/// Built on the stack per field: encoding a record allocates only its output buffer.
 enum Value<'a> {
     Str(&'a str),
-    Owned(String),
+    Ts(OffsetDateTime),
+    Addr(SocketAddr),
     Bool(bool),
     U64(u64),
+}
+
+/// Displays a timestamp exactly as [`format_timestamp`] does, without an intermediate `String`.
+struct Timestamp(OffsetDateTime);
+
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ts = self.0.to_offset(UtcOffset::UTC);
+        if (0..=9999).contains(&ts.year()) {
+            write!(
+                f,
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+                ts.year(),
+                u8::from(ts.month()),
+                ts.day(),
+                ts.hour(),
+                ts.minute(),
+                ts.second(),
+                ts.millisecond()
+            )
+        } else {
+            f.write_str(&format_timestamp(ts))
+        }
+    }
 }
 
 impl Serialize for Value<'_> {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         match self {
             Value::Str(v) => s.serialize_str(v),
-            Value::Owned(v) => s.serialize_str(v),
+            Value::Ts(v) => s.collect_str(&Timestamp(*v)),
+            Value::Addr(v) => s.collect_str(v),
             Value::Bool(v) => s.serialize_bool(*v),
             Value::U64(v) => s.serialize_u64(*v),
         }
     }
 }
 
+/// Receives a record's fields in emission order.
+trait FieldVisitor {
+    fn field(&mut self, key: &'static str, value: Value<'_>);
+}
+
+/// The single definition of each record's field order, shared by both encoders.
 trait Fields {
-    fn fields(&self, include_routing_fields: bool) -> Vec<(&'static str, Value<'_>)>;
+    fn visit_fields(&self, include_routing_fields: bool, v: &mut impl FieldVisitor);
 }
 
 impl Fields for HttpAccessRecord {
-    fn fields(&self, include_routing_fields: bool) -> Vec<(&'static str, Value<'_>)> {
-        let mut out = Vec::with_capacity(15);
-        out.push(("ts", Value::Owned(format_timestamp(self.ts))));
-        out.push(("kind", Value::Str("http")));
+    fn visit_fields(&self, include_routing_fields: bool, v: &mut impl FieldVisitor) {
+        v.field("ts", Value::Ts(self.ts));
+        v.field("kind", Value::Str("http"));
         if let Some(dir) = self.direction {
-            out.push(("direction", Value::Str(dir.as_str())));
+            v.field("direction", Value::Str(dir.as_str()));
         }
-        out.push(("client", Value::Owned(self.client.to_string())));
-        out.push(("proto", Value::Str(&self.proto)));
-        out.push(("mitm", Value::Bool(self.mitm)));
-        out.push(("method", Value::Str(&self.method)));
-        out.push(("target", Value::Str(&self.target)));
+        v.field("client", Value::Addr(self.client));
+        v.field("proto", Value::Str(&self.proto));
+        v.field("mitm", Value::Bool(self.mitm));
+        v.field("method", Value::Str(&self.method));
+        v.field("target", Value::Str(&self.target));
         if include_routing_fields {
-            out.push(("rule", Value::Str(&self.rule)));
-            out.push(("profile", Value::Str(&self.profile)));
-            out.push(("upstream", Value::Str(&self.upstream)));
+            v.field("rule", Value::Str(&self.rule));
+            v.field("profile", Value::Str(&self.profile));
+            v.field("upstream", Value::Str(&self.upstream));
         }
-        out.push(("status", Value::U64(u64::from(self.status))));
-        out.push(("bytes_in", Value::U64(self.bytes_in)));
-        out.push(("bytes_out", Value::U64(self.bytes_out)));
-        out.push(("duration_ms", Value::U64(self.duration_ms)));
-        out
+        v.field("status", Value::U64(u64::from(self.status)));
+        v.field("bytes_in", Value::U64(self.bytes_in));
+        v.field("bytes_out", Value::U64(self.bytes_out));
+        v.field("duration_ms", Value::U64(self.duration_ms));
     }
 }
 
 impl Fields for SocksLogRecord {
-    fn fields(&self, include_routing_fields: bool) -> Vec<(&'static str, Value<'_>)> {
-        let mut out = Vec::with_capacity(14);
-        out.push(("ts", Value::Owned(format_timestamp(self.ts))));
-        out.push(("kind", Value::Str("socks")));
+    fn visit_fields(&self, include_routing_fields: bool, v: &mut impl FieldVisitor) {
+        v.field("ts", Value::Ts(self.ts));
+        v.field("kind", Value::Str("socks"));
         if let Some(dir) = self.direction {
-            out.push(("direction", Value::Str(dir.as_str())));
+            v.field("direction", Value::Str(dir.as_str()));
         }
-        out.push(("client", Value::Owned(self.client.to_string())));
-        out.push(("proto", Value::Str(&self.proto)));
-        out.push(("cmd", Value::Str(&self.cmd)));
-        out.push(("target", Value::Str(&self.target)));
+        v.field("client", Value::Addr(self.client));
+        v.field("proto", Value::Str(&self.proto));
+        v.field("cmd", Value::Str(&self.cmd));
+        v.field("target", Value::Str(&self.target));
         if include_routing_fields {
-            out.push(("rule", Value::Str(&self.rule)));
-            out.push(("profile", Value::Str(&self.profile)));
-            out.push(("upstream", Value::Str(&self.upstream)));
+            v.field("rule", Value::Str(&self.rule));
+            v.field("profile", Value::Str(&self.profile));
+            v.field("upstream", Value::Str(&self.upstream));
         }
-        out.push(("status", Value::Str(&self.status)));
-        out.push(("bytes_in", Value::U64(self.bytes_in)));
-        out.push(("bytes_out", Value::U64(self.bytes_out)));
-        out.push(("duration_ms", Value::U64(self.duration_ms)));
-        out
+        v.field("status", Value::Str(&self.status));
+        v.field("bytes_in", Value::U64(self.bytes_in));
+        v.field("bytes_out", Value::U64(self.bytes_out));
+        v.field("duration_ms", Value::U64(self.duration_ms));
     }
 }
 
-struct FieldMap<'a>(&'a [(&'static str, Value<'a>)]);
-
-impl Serialize for FieldMap<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut map = s.serialize_map(Some(self.0.len()))?;
-        for (k, v) in self.0 {
-            map.serialize_entry(k, v)?;
-        }
-        map.end()
-    }
-}
-
-/// Quote a logfmt value when it is empty or contains spaces, quotes, `=`, or control chars.
-fn logfmt_value(v: &str) -> String {
+/// Write `v` as a logfmt value, quoting it when it is empty or contains spaces, quotes, `=`,
+/// or control chars.
+fn write_logfmt_value(out: &mut String, v: &str) {
     let needs_quotes = v.is_empty()
         || v.chars()
             .any(|c| c == ' ' || c == '"' || c == '=' || c.is_control());
     if !needs_quotes {
-        return v.to_string();
+        out.push_str(v);
+        return;
     }
-    let mut out = String::with_capacity(v.len() + 2);
+    out.reserve(v.len() + 2);
     out.push('"');
     for c in v.chars() {
         match c {
@@ -473,35 +543,107 @@ fn logfmt_value(v: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
             c => out.push(c),
         }
     }
     out.push('"');
-    out
 }
 
-fn encode(fields: &[(&'static str, Value<'_>)], format: LogFormat) -> String {
+/// logfmt encoder writing straight into one pre-sized line buffer.
+struct TextEncoder {
+    line: String,
+}
+
+impl FieldVisitor for TextEncoder {
+    fn field(&mut self, key: &'static str, value: Value<'_>) {
+        if !self.line.is_empty() {
+            self.line.push(' ');
+        }
+        self.line.push_str(key);
+        self.line.push('=');
+        match value {
+            Value::Str(s) => write_logfmt_value(&mut self.line, s),
+            // Timestamps and socket addresses never contain characters that need quoting.
+            Value::Ts(ts) => {
+                let _ = write!(self.line, "{}", Timestamp(ts));
+            }
+            Value::Addr(a) => {
+                let _ = write!(self.line, "{a}");
+            }
+            Value::Bool(b) => self.line.push_str(if b { "true" } else { "false" }),
+            Value::U64(n) => {
+                let _ = write!(self.line, "{n}");
+            }
+        }
+    }
+}
+
+/// JSON encoder feeding fields straight into a serde map (no intermediate field list).
+struct MapVisitor<'m, M: SerializeMap> {
+    map: &'m mut M,
+    err: Option<M::Error>,
+}
+
+impl<M: SerializeMap> FieldVisitor for MapVisitor<'_, M> {
+    fn field(&mut self, key: &'static str, value: Value<'_>) {
+        if self.err.is_none() {
+            if let Err(e) = self.map.serialize_entry(key, &value) {
+                self.err = Some(e);
+            }
+        }
+    }
+}
+
+/// Zero-allocation `Serialize` view of a record as one JSON object.
+struct JsonRecord<'a, R> {
+    record: &'a R,
+    include_routing_fields: bool,
+}
+
+impl<R: Fields> Serialize for JsonRecord<'_, R> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        let mut visitor = MapVisitor {
+            map: &mut map,
+            err: None,
+        };
+        self.record
+            .visit_fields(self.include_routing_fields, &mut visitor);
+        if let Some(e) = visitor.err {
+            return Err(e);
+        }
+        map.end()
+    }
+}
+
+/// Initial capacity of an encoded line; typical records fit without regrowing.
+const LINE_CAPACITY: usize = 256;
+
+fn encode(record: &impl Fields, format: LogFormat, include_routing_fields: bool) -> String {
     match format {
         LogFormat::Text => {
-            let mut line = String::new();
-            for (i, (k, v)) in fields.iter().enumerate() {
-                if i > 0 {
-                    line.push(' ');
-                }
-                line.push_str(k);
-                line.push('=');
-                match v {
-                    Value::Str(s) => line.push_str(&logfmt_value(s)),
-                    Value::Owned(s) => line.push_str(&logfmt_value(s)),
-                    Value::Bool(b) => line.push_str(if *b { "true" } else { "false" }),
-                    Value::U64(n) => line.push_str(&n.to_string()),
-                }
-            }
-            line
+            let mut enc = TextEncoder {
+                line: String::with_capacity(LINE_CAPACITY),
+            };
+            record.visit_fields(include_routing_fields, &mut enc);
+            enc.line
         }
-        LogFormat::Json => serde_json::to_string(&FieldMap(fields))
-            .unwrap_or_else(|e| format!("{{\"log_encode_error\":{:?}}}", e.to_string())),
+        LogFormat::Json => {
+            let mut buf = Vec::with_capacity(LINE_CAPACITY);
+            let view = JsonRecord {
+                record,
+                include_routing_fields,
+            };
+            match serde_json::to_writer(&mut buf, &view) {
+                // serde_json only ever writes valid UTF-8.
+                Ok(()) => String::from_utf8(buf)
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+                Err(e) => format!("{{\"log_encode_error\":{:?}}}", e.to_string()),
+            }
+        }
     }
 }
 
@@ -513,7 +655,7 @@ impl HttpAccessRecord {
 
     /// Encode as one line, optionally omitting `rule`, `profile`, and `upstream`.
     pub fn format_with(&self, format: LogFormat, include_routing_fields: bool) -> String {
-        encode(&self.fields(include_routing_fields), format)
+        encode(self, format, include_routing_fields)
     }
 }
 
@@ -525,7 +667,7 @@ impl SocksLogRecord {
 
     /// Encode as one line, optionally omitting `rule`, `profile`, and `upstream`.
     pub fn format_with(&self, format: LogFormat, include_routing_fields: bool) -> String {
-        encode(&self.fields(include_routing_fields), format)
+        encode(self, format, include_routing_fields)
     }
 }
 
@@ -834,6 +976,43 @@ impl AccessLogger {
         }
     }
 
+    /// Non-blocking [`Self::log_http`]: delivers `record` to the sink (if any) and queues
+    /// its formatted line with `try_send`. Returns the formatted line only when the writer
+    /// queue is full, so the caller can finish delivery with [`Self::send_http_line`].
+    pub(crate) fn try_log_http(&self, record: &HttpAccessRecord) -> Option<String> {
+        let mut owned;
+        let record = if record.direction.is_none() && self.direction.is_some() {
+            owned = record.clone();
+            owned.direction = self.direction;
+            &owned
+        } else {
+            record
+        };
+        if let Some(sink) = &self.sink {
+            sink(&AccessRecord::Http(record.clone()));
+        }
+        if !self.http_active {
+            return None;
+        }
+        let tx = self.tx.as_ref()?;
+        let line = record.format_with(self.format, self.include_routing_fields);
+        match tx.try_send(Command::Http(line)) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(Command::Http(line))) => Some(line),
+            Err(mpsc::error::TrySendError::Full(_)) => None,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.errors
+                    .error("access logger is shut down; dropping record");
+                None
+            }
+        }
+    }
+
+    /// Queue an already formatted HTTP line, waiting for room (see [`Self::try_log_http`]).
+    pub(crate) async fn send_http_line(&self, line: String) {
+        self.send(Command::Http(line)).await;
+    }
+
     /// Record a SOCKS connection entry.
     pub async fn log_socks(&self, record: &SocksLogRecord) {
         let mut owned;
@@ -1014,6 +1193,29 @@ mod tests {
             format_timestamp(datetime!(2026-11-22 15:30:01 +02:00)),
             "2026-11-22T13:30:01.000Z"
         );
+    }
+
+    #[test]
+    fn inline_timestamp_matches_format_timestamp() {
+        for ts in [
+            datetime!(2026-11-22 13:30:01.123456 UTC),
+            datetime!(2026-11-22 15:30:01 +02:00),
+            datetime!(2026-01-01 00:00:00.999999 -05:30),
+            datetime!(0001-02-03 04:05:06.007 UTC),
+            datetime!(9999-12-31 23:59:59.999 UTC),
+        ] {
+            assert_eq!(Timestamp(ts).to_string(), format_timestamp(ts));
+        }
+    }
+
+    #[test]
+    fn logfmt_escapes_control_chars_in_place() {
+        let mut out = String::from("k=");
+        write_logfmt_value(&mut out, "a\u{1}\"b\\\n");
+        assert_eq!(out, "k=\"a\\u{1}\\\"b\\\\\\n\"");
+        let mut out = String::new();
+        write_logfmt_value(&mut out, "");
+        assert_eq!(out, "\"\"");
     }
 
     #[test]
@@ -1406,6 +1608,34 @@ mod tests {
         // A dropped receiver does not break logging.
         drop(rx);
         logger.log_http(&http_record()).await;
+    }
+
+    #[tokio::test]
+    async fn try_log_http_queues_without_blocking_and_hands_back_on_full() {
+        let stdout = Buf::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let logger = AccessLogger::start_with_stdout(
+            AccessLogConfig::new(LogLevel::Debug, LogFormat::Text, None, None),
+            Box::new(stdout.clone()),
+            Logger::with_writer(LogLevel::Quiet, Box::new(io::sink())),
+        )
+        .await
+        .unwrap()
+        .with_channel(tx);
+        // On the current-thread test runtime the writer task cannot run until we yield, so
+        // the queue fills after exactly CHANNEL_CAPACITY records.
+        for _ in 0..CHANNEL_CAPACITY {
+            assert_eq!(logger.try_log_http(&http_record()), None);
+        }
+        let line = logger.try_log_http(&http_record());
+        assert_eq!(line, Some(http_record().format(LogFormat::Text)));
+        logger.send_http_line(line.unwrap()).await;
+        logger.shutdown().await.unwrap();
+        let expected = format!("{}\n", http_record().format(LogFormat::Text));
+        assert_eq!(stdout.text(), expected.repeat(CHANNEL_CAPACITY + 1));
+        for _ in 0..=CHANNEL_CAPACITY {
+            assert_eq!(rx.recv().await, Some(AccessRecord::Http(http_record())));
+        }
     }
 
     #[tokio::test]

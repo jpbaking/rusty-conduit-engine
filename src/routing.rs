@@ -901,6 +901,60 @@ pub trait RouteResolver: Send + Sync + fmt::Debug {
     /// A view whose [`Self::resolve`] and [`Self::state`] stay consistent with each other
     /// and fixed from now on (for a hot-reloadable resolver: the current snapshot).
     fn pin(&self) -> Arc<dyn RouteResolver>;
+
+    /// Route like [`Self::resolve`], answering `resolve_dns` lookups from `ips` (already
+    /// resolved by the caller) instead of blocking DNS. `None` (the default) means the
+    /// resolver does not support this and [`Self::resolve`] must be used; the built-in
+    /// resolvers return `Some(router.route_with_ips(..))`.
+    fn resolve_with_ips(
+        &self,
+        req: &RouteRequest<'_>,
+        ips: &[IpAddr],
+    ) -> Option<Result<RouteDecision, AccessDenied>> {
+        let _ = (req, ips);
+        None
+    }
+}
+
+/// Route `req` through `resolver`, resolving the hostname asynchronously first when a
+/// `resolve_dns` rule for its inbound protocol could need it.
+///
+/// When [`Router::needs_dns`] holds for the resolver's snapshot and `req.host` is not an IP
+/// literal, the host is looked up with [`tokio::net::lookup_host`], bounded by
+/// `dns_timeout` (a failure or timeout yields no addresses, like the blocking
+/// [`crate::router::SystemResolver`]), and the result is handed to
+/// [`RouteResolver::resolve_with_ips`]. Otherwise, or when the resolver does not support
+/// pre-resolved addresses, this is [`RouteResolver::resolve`]. Results are never cached.
+pub async fn resolve_route_async(
+    resolver: &dyn RouteResolver,
+    req: &RouteRequest<'_>,
+    dns_timeout: Duration,
+) -> Result<RouteDecision, AccessDenied> {
+    if !resolver.state().router.needs_dns(req.inbound) || is_ip_literal(req.host) {
+        return resolver.resolve(req);
+    }
+    let host = crate::router::normalize_host(req.host);
+    let ips: Vec<IpAddr> = match tokio::time::timeout(
+        dns_timeout,
+        tokio::net::lookup_host((host.as_str(), req.port)),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => addrs.map(|a| a.ip()).collect(),
+        _ => Vec::new(),
+    };
+    resolver
+        .resolve_with_ips(req, &ips)
+        .unwrap_or_else(|| resolver.resolve(req))
+}
+
+/// Whether `host` (brackets tolerated) is an IP literal.
+fn is_ip_literal(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<IpAddr>().is_ok()
 }
 
 impl RouteResolver for RoutingState {
@@ -914,6 +968,14 @@ impl RouteResolver for RoutingState {
 
     fn pin(&self) -> Arc<dyn RouteResolver> {
         Arc::new(self.clone())
+    }
+
+    fn resolve_with_ips(
+        &self,
+        req: &RouteRequest<'_>,
+        ips: &[IpAddr],
+    ) -> Option<Result<RouteDecision, AccessDenied>> {
+        Some(self.router.route_with_ips(req, ips))
     }
 }
 
@@ -929,6 +991,14 @@ impl RouteResolver for ArcSwap<RoutingState> {
     fn pin(&self) -> Arc<dyn RouteResolver> {
         Arc::new(PinnedState(self.load_full()))
     }
+
+    fn resolve_with_ips(
+        &self,
+        req: &RouteRequest<'_>,
+        ips: &[IpAddr],
+    ) -> Option<Result<RouteDecision, AccessDenied>> {
+        Some(self.load().router.route_with_ips(req, ips))
+    }
 }
 
 impl RouteResolver for SharedRouting {
@@ -942,6 +1012,14 @@ impl RouteResolver for SharedRouting {
 
     fn pin(&self) -> Arc<dyn RouteResolver> {
         self.as_ref().pin()
+    }
+
+    fn resolve_with_ips(
+        &self,
+        req: &RouteRequest<'_>,
+        ips: &[IpAddr],
+    ) -> Option<Result<RouteDecision, AccessDenied>> {
+        self.as_ref().resolve_with_ips(req, ips)
     }
 }
 
@@ -960,6 +1038,14 @@ impl RouteResolver for PinnedState {
 
     fn pin(&self) -> Arc<dyn RouteResolver> {
         Arc::new(PinnedState(Arc::clone(&self.0)))
+    }
+
+    fn resolve_with_ips(
+        &self,
+        req: &RouteRequest<'_>,
+        ips: &[IpAddr],
+    ) -> Option<Result<RouteDecision, AccessDenied>> {
+        Some(self.0.router.route_with_ips(req, ips))
     }
 }
 
@@ -1317,5 +1403,70 @@ mod tests {
         )
         .with_external("ssh", Arc::new(NullDialer));
         assert!(state.registry.get("ssh").is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_route_async_resolves_only_for_dns_rules() {
+        let input = test_support::input(
+            "[profiles.p]\ntype = \"socks5\"\nhost = \"10.0.0.1\"\nport = 1080\n\
+             [[routing.rules]]\nname = \"loop\"\ncidr = [\"127.0.0.0/8\", \"::1/128\"]\n\
+             resolve_dns = true\ntarget = \"p\"\n",
+        );
+        let state = RoutingState::from_input(&input, DialerOptions::default()).unwrap();
+        assert!(state.router.needs_dns(Inbound::Socks));
+        let t = Duration::from_secs(5);
+        // A hostname is resolved asynchronously and matched against the CIDR rule.
+        let req = RouteRequest::new(Inbound::Socks, "localhost", 80);
+        let d = resolve_route_async(&state, &req, t).await.unwrap();
+        assert_eq!(d.rule.as_deref(), Some("loop"));
+        // IP literals skip DNS and match directly.
+        for host in ["127.0.0.1", "[::1]"] {
+            let req = RouteRequest::new(Inbound::Socks, host, 80);
+            let d = resolve_route_async(&state, &req, t).await.unwrap();
+            assert_eq!(d.rule.as_deref(), Some("loop"), "{host}");
+        }
+        let req = RouteRequest::new(Inbound::Socks, "10.9.9.9", 80);
+        let d = resolve_route_async(&state, &req, t).await.unwrap();
+        assert_eq!(d.rule, None);
+        // Hot-reloadable and pinned resolvers take the same path.
+        let shared: SharedRouting = Arc::new(ArcSwap::from_pointee(state.clone()));
+        let req = RouteRequest::new(Inbound::Socks, "localhost", 80);
+        let d = resolve_route_async(&shared, &req, t).await.unwrap();
+        assert_eq!(d.rule.as_deref(), Some("loop"));
+        let pinned = shared.pin();
+        let d = resolve_route_async(pinned.as_ref(), &req, t).await.unwrap();
+        assert_eq!(d.rule.as_deref(), Some("loop"));
+    }
+
+    #[tokio::test]
+    async fn resolve_route_async_falls_back_to_resolve_for_custom_resolvers() {
+        #[derive(Debug)]
+        struct Custom(Arc<RoutingState>);
+        impl RouteResolver for Custom {
+            fn resolve(&self, _req: &RouteRequest<'_>) -> Result<RouteDecision, AccessDenied> {
+                let mut d = self
+                    .0
+                    .router
+                    .route(&RouteRequest::new(Inbound::Socks, "x", 1))?;
+                d.rule = Some("custom".into());
+                Ok(d)
+            }
+            fn state(&self) -> Arc<RoutingState> {
+                Arc::clone(&self.0)
+            }
+            fn pin(&self) -> Arc<dyn RouteResolver> {
+                Arc::new(Custom(Arc::clone(&self.0)))
+            }
+        }
+        let input = test_support::input(
+            "[[routing.rules]]\ncidr = \"127.0.0.0/8\"\nresolve_dns = true\ntarget = \"direct\"\n",
+        );
+        let state = RoutingState::from_input(&input, DialerOptions::default()).unwrap();
+        let custom = Custom(Arc::new(state));
+        let req = RouteRequest::new(Inbound::Http, "localhost", 80);
+        let d = resolve_route_async(&custom, &req, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(d.rule.as_deref(), Some("custom"));
     }
 }
