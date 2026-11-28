@@ -1,53 +1,64 @@
-# phase-0002 — Server TCP_NODELAY, HTTP/1.1 header-read timeout, and drain_timeout task abort
+# phase-0002 — Contract amendment, opt-in features, and aligned default constants
 
 - Status: done
-- Owner: executor
+- Owner: planner
 - Depends on: phase-0001
-- Goal: Set `TCP_NODELAY` on accepted client sockets (`P-03`), add an HTTP/1.1 header-read timeout to defeat slowloris permit exhaustion (`B-06`), and abort remaining connection tasks when `drain_timeout` expires (`B-06`).
-- Done when: every command in `## Verify` exits 0.
-- Pattern to follow: `src/server.rs:595-626` (`accept_loop` socket options + task spawn) and `src/http/mod.rs:220-230` (`http1::Builder`)
+- Goal: Amend the engine contract to allow CLI support and test fixtures behind opt-in features, add the `cli-support`, `test-support`, and `import` features with their dependencies and empty gated modules, extend CI to `--all-features`, and align the default connection and MITM cache constants with the CLIs.
+- Done when: every command in `## Verify` exits 0; default features pull in no new dependency; `DOX.md` states the amended contract.
+- Pattern to follow: `Cargo.toml:12-14` (the existing `routing = ["dep:regex"]` opt-in feature) and `src/lib.rs:18-28` (module list)
 
 ## Context
-Accepted client sockets currently leave Nagle's algorithm enabled, causing 40–200 ms stalls with Delayed-ACK on SOCKS5 handshakes and `CONNECT` responses.
-Dedicated HTTP listeners have no header-read timeout, so silent TCP clients can hold `max_connections` permits indefinitely.
-In `Server::run`, `tokio::time::timeout(drain_timeout, tracker.wait())` logs `"connection(s) aborted"` on timeout but does not actually abort the spawned tasks, leaving stuck tasks alive in long-lived embedders like `rusty-conduit-gui`.
+M-01: the engine contract (`DOX.md` Project Contract, "No CLI concerns") forbids signal handling and CLI-oriented dependencies; the roadmap explicitly asks to permit them strictly behind opt-in features. Decision: `cli-support = ["dep:rlimit", "dep:libc", "tokio/signal"]` (`rlimit` and `libc` as `[target.'cfg(unix)'.dependencies]`, optional); `test-support = []` (fixtures use only existing dependencies); `import = ["routing"]` (the importer validates regexes). Still no `clap`, `notify`, or non-dev `toml`.
+Default constants: the CLIs use `DEFAULT_MAX_CONNECTIONS = 4096` and `DEFAULT_MITM_CERT_CACHE_MAX_ENTRIES = 10_240`; the engine has `server::DEFAULT_MAX_CONNECTIONS = 1024` and `mitm::DEFAULT_MITM_CERT_CACHE_MAX = 4096`. Align the engine to 4096 and 10 240 so Phase 3b consumers can use the engine constants; record it as `M-16` (`keep`) in `docs/DIVERGENCE-LEDGER.md`.
+Planner-owned: contract text, feature design, and a behavior change.
 
 ## Scope
-- In: `src/server.rs`, `src/http/mod.rs`
-- Out: `src/http/mitm_tunnel.rs`, `src/net.rs`, `src/upstream/`, `src/router/`, `src/logging.rs`, `docs/`
+- In: `DOX.md`, `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/cli_support/mod.rs` (new), `src/test_support.rs` (new), `src/import/mod.rs` (new), `src/server.rs` and `src/mitm/mod.rs` (the two constants and tests that assert them), `docs/DIVERGENCE-LEDGER.md`, `.github/workflows/ci.yml`, `.github/workflows/release.yml` (verification steps only)
+- Out: `src/routing.rs`, `src/router/`, `scripts/check-pure-rust-crypto.py` (consumers copy it unchanged)
 
 ## Sub-tasks
-1. [done] In `src/server.rs` (`accept_loop`), call `let _ = stream.set_nodelay(true);` on every accepted client socket right before/alongside `ka.apply(&stream)`. Add a unit test in `src/server.rs` verifying `conn.stream.nodelay()` is `true` inside a handler — done when: `cargo test --locked nodelay` passes.
-2. [done] In `src/http/mod.rs`, add `pub const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);`, store `header_read_timeout: Option<Duration>` (default `Some(DEFAULT_HEADER_READ_TIMEOUT)`) on `HttpProxy`, and add `pub fn with_header_read_timeout(mut self, timeout: Option<Duration>) -> Self`. In `HttpProxy::serve`, configure `http1::Builder::new().timer(hyper_util::rt::TokioTimer::new()).header_read_timeout(self.header_read_timeout)` (do not use `hyper_util` features not already enabled — verify `TokioTimer` compiles with existing `Cargo.toml`). Add a unit test proving a silent TCP client is closed after a short `header_read_timeout` (e.g., 100 ms) — done when: `cargo test --locked header_read_timeout` passes.
-3. [done] In `src/server.rs`, track spawned connection tasks' `AbortHandle`s in an `Arc<DashMap<u64, tokio::task::AbortHandle>>` (with an `Arc<AtomicU64>` ID counter) alongside `TaskTracker`; each spawned task removes its own ID from the `DashMap` via a drop guard when it exits (whether normally or aborted). When `tokio::time::timeout(drain_timeout, tracker.wait())` times out in `Server::run`, abort every remaining handle in the `DashMap` (`for entry in abort_handles.iter() { entry.value().abort(); }`). Add a unit test in `src/server.rs` with a handler that awaits `std::future::pending::<()>()` while holding a drop-flag `Arc<AtomicBool>`, and assert that after `drain_timeout` expires `ShutdownReport { drained: false }` is returned AND the drop-flag becomes `true` — done when: `cargo test --locked drain_timeout_aborts` passes.
-
-4. [done] Fix-up: run `cargo fmt` to repair the `cargo fmt --check` failure (import order in `src/server.rs` and a long line in the nodelay test recorder) — done when: `cargo fmt --check` exits 0.
+1. [done] `DOX.md` Project Contract: rewrite "No CLI concerns" to allow, only behind the opt-in `cli-support` feature, resource-limit raising (`rlimit`), path preflight (`libc`), shutdown-signal waiting (tokio `signal`), and shared config-file section types (serde only); still no `clap`, `notify`, non-dev `toml`, argument parsing, file watching, or SSH supervision. Add `test-support` (fixtures for consumers' tests) and `import` (`.bak` importer) to the feature bullets; add the `--all-features` checks to Verification — done when: `grep -c 'cli-support' DOX.md` prints at least `2`.
+2. [done] `Cargo.toml` features and optional deps; `cargo update -p` nothing else (only the new optional entries may appear in `Cargo.lock`) — done when: `cargo tree -e normal --target all --depth 1 | grep -cE '(rlimit|libc) v'` prints `0` and the same with `--features cli-support` prints `2` (direct dependencies only: `libc` is already a transitive dependency of tokio and socket2).
+3. [done] Empty gated modules with module docs: `#[cfg(feature = "cli-support")] pub mod cli_support;`, `#[cfg(feature = "test-support")] pub mod test_support;`, `#[cfg(feature = "import")] pub mod import;` — done when: `cargo check --all-features --locked` and `cargo check --no-default-features --locked` pass.
+4. [done] Constants 4096 / 10 240, adjust any test asserting the old values, add `M-16` to the divergence ledger — done when: `cargo test --locked` passes and `grep -c '^| M-16' docs/DIVERGENCE-LEDGER.md` prints `1`.
+5. [done] CI: add `cargo clippy --all-targets --all-features --locked -- -D warnings` and `cargo test --all-features --locked` to `.github/workflows/ci.yml` (lint and test jobs) and the same test step to `release.yml`'s verify job — done when: `grep -c 'all-features' .github/workflows/ci.yml` prints at least `2` and both files parse with `ruby -ryaml`.
 
 ## Verify
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --no-default-features --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --locked
 cargo test --no-default-features --locked
+cargo test --all-features --locked
+python3 scripts/check-pure-rust-crypto.py
+test "$(cargo tree -e normal --target all --depth 1 | grep -cE '(rlimit|libc) v')" = 0
+test "$(cargo tree -e normal --target all | grep -c 'rlimit v')" = 0
+ruby -ryaml -e 'ARGV.each { |f| YAML.load_file(f) }' .github/workflows/ci.yml .github/workflows/release.yml
+git diff --exit-code -- src/routing.rs src/router scripts
 ```
 
 ## Escalate when
-- `hyper_util::rt::TokioTimer` is not enabled by the existing `Cargo.toml` features (do not edit `Cargo.toml` without planner approval) → stop, set Status: needs-human — reason: paste the compiler error.
-- Any existing `src/server.rs` or `tests/` shutdown test regresses → stop, set Status: needs-human — reason: paste the failing test output.
+- Adding the optional dependencies changes any other `Cargo.lock` entry → stop and record why before continuing.
+- A consumer-visible test asserts the old constant values in a way that implies a contract → record it in the divergence entry.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: `accept_loop` calls `stream.set_nodelay(true)` (debug-logs failure) before keepalive; Recorder records `conn.stream.nodelay()`; added `accepted_client_sockets_get_tcp_nodelay`
-- sub-task 2: added `DEFAULT_HEADER_READ_TIMEOUT` (30s), `HttpProxy.header_read_timeout` + `with_header_read_timeout`; `serve` uses `http1::Builder::new().timer(TokioTimer::new()).header_read_timeout(..)`; `TokioTimer` compiled with the existing `hyper-util` `tokio` feature (Cargo.toml untouched); added `header_read_timeout_closes_silent_clients`
-- sub-task 3: added `ConnectionTasks` (`Arc<AtomicU64>` ID + `Arc<DashMap<u64, AbortHandle>>`) and `AbortHandleGuard` drop guard; `Server::run` calls `abort_all()` when the drain times out; after inserting a handle, `accept_loop` removes it again if the task already finished (avoids a stale entry when the task ended before registration); added `drain_timeout_aborts_stuck_connection_tasks`
-- Verify run 1: `cargo fmt --check` failed (formatting only); clippy x2 passed
-- sub-task 4 (fix-up 1): ran `cargo fmt`; Verify run 2 passed in full
+- planner begins phase-0002 (planner-owned)
+- planner corrected the dependency check: `libc` is already a transitive default dependency (tokio, socket2), so the check now looks at direct dependencies (`--depth 1`) and at `rlimit` anywhere
+
+- sub-task 1: DOX contract — "No CLI concerns in default builds" plus three opt-in feature bullets; Verification gains the two --all-features checks; Feature Map gains "Opt-in features"
+- sub-task 2: features cli-support / test-support / import; optional unix deps rlimit 0.12 and libc 0.2; Cargo.lock gained only rlimit, signal-hook-registry, errno (tokio `signal`) — no existing entry changed
+- sub-task 3: gated module stubs in src/lib.rs with module docs
+- sub-task 4: DEFAULT_MAX_CONNECTIONS 1024 → 4096, DEFAULT_MITM_CERT_CACHE_MAX 4096 → 10_240; no test asserted the literal values; M-16 (keep) added
+- sub-task 5: ci.yml lint + test jobs and release.yml verify job run --all-features clippy/test
+- note: cargo warns "unused dependency `rlimit`" until phase-0003 adds the code; not a clippy failure
+- phase-0002 verified and closed
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test --locked nodelay` → `server::tests::accepted_client_sockets_get_tcp_nodelay ... ok` (plus existing `direct_connects_with_nodelay_and_keepalive ... ok`); change at src/server.rs:636, test at src/server.rs:897
-- `cargo test --locked header_read_timeout` → `http::tests::header_read_timeout_closes_silent_clients ... ok`, finished in 0.11s (100 ms timeout fired); src/http/mod.rs:123, :173, :238, test :585
-- `cargo test --locked drain_timeout_aborts` → `server::tests::drain_timeout_aborts_stuck_connection_tasks ... ok` (asserts `ShutdownReport { drained: false }` and drop flag set); src/server.rs:72, :87, :577, :675, test :1152
-- Verify run 1: `cargo fmt --check` → diff in src/server.rs (import order, line wrap); `cargo clippy --all-targets --locked -- -D warnings` → Finished, no warnings; `cargo clippy --all-targets --no-default-features --locked -- -D warnings` → Finished, no warnings
-- Verify run 2 (after `cargo fmt`): `cargo fmt --check` → exit 0; both clippy runs → Finished, no warnings; `cargo test --locked` → 185+5+4+6+2+1+0 passed, 0 failed (203 total, was 200); `cargo test --no-default-features --locked` → 174+5+4+6+2+0+0 passed, 0 failed (191 total, was 188); existing shutdown tests `shutdown_drain_is_bounded` / `shutdown_drains_connections_that_honour_cancellation` still pass
+- `cargo fmt --check` → exit 0; clippy default / --no-default-features / --all-features → exit 0
+- `cargo test --locked` → 225 passed; `--no-default-features` → 213 passed; `--all-features` → 225 passed; PURE_RUST_CRYPTO_OK
+- `cargo tree -e normal --target all --depth 1 | grep -cE '(rlimit|libc) v'` → 0; with `--features cli-support` → 2 (libc, rlimit); `rlimit` anywhere in the default tree → 0
+- `grep -c 'cli-support' DOX.md` → 3; `grep -c '^| M-16' docs/DIVERGENCE-LEDGER.md` → 1; `grep -c 'all-features' .github/workflows/ci.yml` → 2; ruby YAML parse of both workflows → exit 0

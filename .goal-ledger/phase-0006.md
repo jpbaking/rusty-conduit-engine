@@ -1,54 +1,61 @@
-# phase-0006 — Fast-path logging, non-blocking AccessGuard::drop, single-buffer log encoding, and DOX/Divergence Ledger closeout
+# phase-0006 — import: move the AirSwitch importer into the engine
 
 - Status: done
 - Owner: executor
 - Depends on: phase-0005
-- Goal: Eliminate hot-path allocations when logging is disabled (`P-08`), use non-blocking `try_send` in `AccessGuard::drop` (`P-08`), encode logfmt/JSON directly into a single pre-sized buffer (`P-08`), and record all Phase 2 changes in `docs/DIVERGENCE-LEDGER.md` and `DOX.md` (plus affected child `DOX.md`s).
-- Done when: every command in `## Verify` exits 0.
-- Pattern to follow: `docs/DIVERGENCE-LEDGER.md:78-84` (entries `M-01`–`M-07`) and `src/logging.rs:175-210, 460-518`
+- Goal: Copy rusty-conduit-switch's AirSwitch / ZeroOmega / SwitchyOmega `.bak` converter and its commented-TOML renderer into `rusty_conduit_engine::import`, behind the `import` feature, with behavior unchanged.
+- Done when: every command in `## Verify` exits 0, and all of the importer's own unit tests pass inside the engine.
+- Pattern to follow: `../rusty-conduit-switch/src/import/airswitch.rs` (copy whole) and `../rusty-conduit-switch/src/import/mod.rs` (copy everything except the CLI subcommand)
 
 ## Context
-At default `INFO` log level, hot-path `logger.debug(format!(...))` and `logger.verbose(format!(...))` calls still allocate formatted `String`s before `Logger::log` discards them.
-`RequestCtx::access_guard` allocates an `HttpAccessRecord` and calls `OffsetDateTime::now_utc()` even when `!access.http_enabled()`, and `AccessGuard::drop` spawns a `tokio::spawn` task on every HTTP request even when the 4,096-slot mpsc queue has room.
-`encode` in `src/logging.rs` allocates an intermediate `Vec<(&str, Value)>` plus per-field `String`s on every logged record.
-Finally, `DOX.md` requires recording every observable engine behavior change in `docs/DIVERGENCE-LEDGER.md` and refreshing affected `DOX.md` docs.
+M-02: the switch importer uses only engine `routing` / `router` types (re-exported in switch as `crate::config::*`), so it moves with path changes only. Rename `crate::config::` to `crate::routing::` and keep `crate::router::{BypassList, RuleMatcher}`. `run_import` (the `import-airswitch` subcommand: file I/O, `create_new`, exit codes) and `EXIT_FAILED` stay in switch — do not copy them or the tests that call them. Behavior changes (B-08) are phase-0007's; this phase must not change any output.
+Escalation answered (planner, 2026-11-28): rustfmt sorts `use crate::router::...` before `use crate::routing::...`, so that one moved line is an allowed fidelity difference; the Verify filter now allows it.
+The test `rendered_toml_parses_and_validates` uses switch's `Config` / `FileConfig`; inside the engine, parse the rendered text with the dev-dependency `toml` into a test-local `#[derive(Deserialize)] struct File { #[serde(default)] profiles: BTreeMap<String, ProfileConfig>, routing: RoutingConfig }` and build the router with `crate::router::Router::from_input(&RoutingInput { profiles: file.profiles, routing: file.routing, ..RoutingInput::default() })`.
 
 ## Scope
-- In: `src/logging.rs`, `src/http/mod.rs`, `src/http/forward.rs`, `src/http/tunnel.rs`, `src/http/mitm_tunnel.rs`, `src/socks/mod.rs`, `src/server.rs`, `src/upstream/mod.rs`, `docs/DIVERGENCE-LEDGER.md`, `DOX.md`, `src/http/DOX.md`, `src/mitm/DOX.md`, `src/router/DOX.md`, `src/upstream/DOX.md`
-- Out: `Cargo.toml`, `Cargo.lock`, `scripts/`, `.github/`
+- In: `src/import/mod.rs`, `src/import/airswitch.rs` (new)
+- Out: `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/routing.rs`, `src/router/`, every other `src/` file, the consumer repos (read-only sources)
 
 ## Sub-tasks
-1. [done] In `src/logging.rs`, add `pub fn log_fmt(&self, level: LogLevel, args: fmt::Arguments<'_>)` on `Logger` and `pub(crate)` macros `log_error!`, `log_info!`, `log_debug!`, `log_verbose!` that check `$logger.enabled(...)` before calling `format_args!(...)`. Replace hot-path `logger.debug(format!(...))` and `logger.verbose(format!(...))` calls in `src/server.rs`, `src/http/`, `src/socks/mod.rs`, and `src/upstream/mod.rs` with `log_debug!` / `log_verbose!` (keep the existing `Logger::debug`/`verbose` public methods intact) — done when: `cargo test --locked logging` passes.
-2. [done] In `src/logging.rs`, rewrite `HttpAccessRecord::format_with` and `SocksLogRecord::format_with` to encode logfmt directly into `String::with_capacity(256)` via `std::fmt::Write` (no intermediate `Vec<(&str, Value)>` and no per-field `String` allocations; write `logfmt_value` directly into the target `&mut String`), and encode JSON directly via a zero-vec `Serialize` wrapper on the record structs — preserving byte-identical text and JSON output (every existing `src/logging.rs` formatting test must pass unchanged) — done when: `cargo test --locked logging` passes.
-3. [done] In `src/logging.rs`, add a non-blocking `pub(crate) fn try_log_http(&self, record: &HttpAccessRecord) -> Result<(), String>` (or `Option<String>` returning the formatted line only if `tx.try_send` returned `TrySendError::Full`, after invoking `sink` if present). In `src/http/mod.rs`, skip `OffsetDateTime::now_utc()` and `HttpAccessRecord` allocation in `RequestCtx::access_guard` when `!self.proxy.access.http_enabled()` (setting `record: None` while keeping `bytes_in`/`bytes_out`/`traffic` intact), and in `AccessGuard::drop` call `try_log_http` first, spawning onto `self.tasks` only when the channel is full. In `src/socks/mod.rs`, skip constructing `SocksLogRecord` and calling `OffsetDateTime::now_utc()` when `!self.access.socks_enabled()` — done when: `cargo test --locked` passes.
-4. [done] Record all Phase 2 observable changes in `docs/DIVERGENCE-LEDGER.md` (continuing from `M-07` with `M-08` onward: MITM bypass normalization, HTTP/1.1 header-read timeout + MITM H2 stream cap + `drain_timeout` task abort, `TCP_NODELAY`, async DNS routing, MITM TLS session reuse + scoped URL rules, Happy Eyeballs, passive failover cooldown, 32 KiB relay / `CertCache` O(1) eviction / fast-path logging). Do a DOX closeout pass updating `DOX.md` and any affected child `DOX.md`s (`src/http/DOX.md`, `src/mitm/DOX.md`, `src/router/DOX.md`, `src/upstream/DOX.md`) where local contracts or Feature Maps changed — done when: `grep -c 'M-08' docs/DIVERGENCE-LEDGER.md` is at least 1 and all Verify commands pass.
+1. [done] Copy `../rusty-conduit-switch/src/import/airswitch.rs` to `src/import/airswitch.rs`; change its `use crate::config::{...}` to `use crate::routing::{...}` with the same names — done when: `cargo build --features import --locked` succeeds.
+2. [done] Replace the planner's `src/import/mod.rs` body (keep the planner's module doc, adjusting it to describe `convert` and `render_toml`) with `../rusty-conduit-switch/src/import/mod.rs` minus `run_import`, `EXIT_FAILED`, the imports only they use, and the tests `run_import_refuses_overwrite_without_force` and `run_import_reports_errors` (and the `tmp` helper if only they use it); `use crate::config::{...}` becomes `use crate::routing::{...}` — done when: `cargo clippy --all-targets --features import --locked -- -D warnings` passes.
+3. [done] Rewrite `rendered_toml_parses_and_validates` as described in Context — done when: `cargo test --features import --locked import::` passes with every remaining importer test.
+4. [done] Copy-fidelity check: `diff ../rusty-conduit-switch/src/import/airswitch.rs src/import/airswitch.rs | grep '^[<>]' | grep -v 'crate::config::\|crate::routing::'` prints nothing (only the `use` path lines differ; wrap-around lines of that one `use` statement are allowed and must be listed in Evidence) — done when: the command prints nothing or only those `use`-statement lines, recorded in Evidence.
 
 ## Verify
 ```sh
 cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo clippy --all-targets --no-default-features --locked -- -D warnings
-cargo test --locked
-cargo test --no-default-features --locked
-python3 scripts/check-pure-rust-crypto.py
+cargo test --all-features --locked
+cargo test --features import --locked import::
+test -z "$(diff ../rusty-conduit-switch/src/import/airswitch.rs src/import/airswitch.rs | grep '^[<>]' | grep -v 'crate::config\|crate::routing\|crate::router::{BypassList, RuleMatcher}\|^[<>]     [A-Za-z_, ]*$\|^[<>] };')"
+git diff --exit-code -- Cargo.toml Cargo.lock src/lib.rs src/routing.rs src/router src/cli_support src/test_support.rs
 ```
 
 ## Escalate when
-- Any existing `src/logging.rs` formatting test changes output even by one character → fix the encoder to match byte-for-byte; if a test depends on internal `Fields` trait visibility, stop, set Status: needs-human — reason: paste the error.
-- `scripts/check-pure-rust-crypto.py` fails → stop, set Status: needs-human — reason: paste the output.
+- The copied code uses a switch-only type (not a re-export of the engine) → stop, set Status: needs-human — reason: name the type and line.
+- A copied test fails inside the engine → stop, set Status: needs-human — reason: name the test and paste the failure (do not change expected output).
 
 ## Log
 - (append-only, one line per event)
-- ST1: added Logger::log_fmt and pub(crate) log_error!/log_info!/log_debug!/log_verbose! (level-checked before format_args!); replaced 42 hot-path debug/verbose(format!(..)) calls in server.rs, http/{mod,forward,tunnel,mitm_tunnel}.rs, socks/mod.rs, upstream/mod.rs
-- ST2: replaced Vec<(&str, Value)> + per-field Strings with a FieldVisitor (stack Value incl. Ts/Addr) shared by a TextEncoder writing into String::with_capacity(256) via fmt::Write (write_logfmt_value in place, inline Timestamp Display) and a zero-vec JsonRecord Serialize wrapper streamed by serde_json::to_writer into Vec::with_capacity(256); added inline_timestamp_matches_format_timestamp and logfmt_escapes_control_chars_in_place tests
-- ST3: added AccessLogger::try_log_http (sink + try_send; returns the line only on TrySendError::Full) and send_http_line; AccessGuard::drop now calls try_log_http and spawns onto self.tasks only when the queue is full; RequestCtx::access_guard (and the MITM new_guard, same pattern) return AccessGuard::untracked (record: None, counters/traffic intact) when !http_enabled; socks Session drops its eager ts and finish() returns before building SocksLogRecord/reading the clock when !socks_enabled (ts now derived as now_utc - elapsed at emit time, since Session::new callers live in out-of-scope v4.rs/v5.rs); added try_log_http_queues_without_blocking_and_hands_back_on_full test
-- ST4: appended M-08..M-15 to docs/DIVERGENCE-LEDGER.md (bypass normalization; header-read timeout + H2 stream cap + drain abort; TCP_NODELAY; async DNS routing; MITM TLS session reuse + scoped URL rules; Happy Eyeballs; failover cooldown; 32 KiB relay / CertCache FIFO / fast-path logging incl. SOCKS ts note); DOX closeout in DOX.md (no-hidden-caches wording now names TLS session-resumption state, new hot-path diagnostics contract, listener/resolver/net/logging Feature Map), src/http, src/mitm, src/router, src/upstream DOX.md
-- Verify block passed on first run; no fix-ups; phase closed
+- sub-task 1: copied `../rusty-conduit-switch/src/import/airswitch.rs` to `src/import/airswitch.rs` and changed `use crate::config::{` to `use crate::routing::{`
+- sub-task 2: replaced `src/import/mod.rs` from switch's `src/import/mod.rs` without `run_import`/`EXIT_FAILED`/CLI-only imports and tests, keeping adjusted module doc and updating `crate::config::` to `crate::routing::`
+- sub-task 3: rewrote `rendered_toml_parses_and_validates` in `src/import/mod.rs` using `toml::from_str` and `Router::from_input`
+- sub-task 4 / Verify: ran `cargo fmt` because `cargo fmt --check` failed on `use crate::routing` before `use crate::router`; after `cargo fmt`, `cargo fmt --check`, clippy, and all tests pass, but `diff` emits `< / > use crate::router::{BypassList, RuleMatcher};`, failing `## Verify` line 31 — escalating to planner
+
+- planner answered the escalation (rustfmt import order), widened the Verify filter, reviewed the full diff of both files against switch (only use lines, the removed `run_import` / `EXIT_FAILED` / their I/O imports and two tests, and the rewritten `rendered_toml_parses_and_validates`; switch's `cfg.validate()` has no engine equivalent and `Router::from_input` still validates the routing), re-ran ## Verify, and closed the phase
 
 ## Evidence
 - (append-only: command → observed result)
-- cargo test --locked logging → 19 passed; 0 failed (lib); grep '\.(debug|verbose)\(' in-scope files → no matches
-- cargo test --locked logging → 21 passed; 0 failed (19 pre-existing unchanged + 2 new); git diff src/logging.rs removes no lines inside mod tests
-- cargo test --locked → lib 205 passed; integration 5+4+6+2+1 passed; 0 failed
-- grep -c 'M-08' docs/DIVERGENCE-LEDGER.md → 1
-- Verify: cargo fmt --check → 0; clippy default -D warnings → 0; clippy --no-default-features -D warnings → 0; cargo test --locked → 0 (lib 205 + integration 18 passed); cargo test --no-default-features --locked → 0 (lib 194 + integration 17 passed); python3 scripts/check-pure-rust-crypto.py → 0, PURE_RUST_CRYPTO_OK
+- `cargo build --features import --locked` → exit 0 (`Finished dev profile ...`)
+- `cargo clippy --all-targets --features import --locked -- -D warnings` → exit 0 (0 warnings)
+- `cargo test --features import --locked import::` → exit 0 (18 passed; 0 failed)
+- `cargo fmt --check` (before `cargo fmt`) → exit 1: rustfmt requires `use crate::router::{BypassList, RuleMatcher};` before `use crate::routing::{...};` in `src/import/airswitch.rs:28-34`
+- `cargo fmt && cargo fmt --check` → exit 0
+- `cargo clippy --all-targets --all-features --locked -- -D warnings` → exit 0
+- `cargo clippy --all-targets --no-default-features --locked -- -D warnings` → exit 0
+- `cargo test --all-features --locked` → exit 0 (243 unit + 5 error_pages + 4 mitm_counters + 6 mitm_h2_upstream_reconnect + 2 route_resolver + 1 traffic_counters passed; 0 failed)
+- `diff ../rusty-conduit-switch/src/import/airswitch.rs src/import/airswitch.rs | grep '^[<>]' | grep -v 'crate::config::\|crate::routing::'` → printed `> use crate::router::{BypassList, RuleMatcher};` and `< use crate::router::{BypassList, RuleMatcher};`
+- `test -z "$(diff ../rusty-conduit-switch/src/import/airswitch.rs src/import/airswitch.rs | grep '^[<>]' | grep -v 'crate::config\|crate::routing\|^[<>]     [A-Za-z_, ]*$\|^[<>] };')"` → exit 1 (failed on the two `use crate::router::{BypassList, RuleMatcher};` lines)
+- planner: fmt/clippy (all-features, no-default) exit 0; `cargo test --all-features --locked` → 261 passed; `cargo test --features import --locked import::` → 18 passed; widened fidelity check → empty; out-of-scope git diff → exit 0

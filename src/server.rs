@@ -269,7 +269,7 @@ pub const DEFAULT_HTTP_PORT: u16 = 3128;
 /// Default SOCKS4/4a/5 listener port.
 pub const DEFAULT_SOCKS_PORT: u16 = 1080;
 /// Default maximum concurrent client connections.
-pub const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
 /// Listener settings, independent of how a CLI loads its configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

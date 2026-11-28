@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::filter::AccessDenied;
 use crate::filter::HostFilter;
@@ -71,7 +71,7 @@ pub enum RoutingError {
 }
 
 /// Inbound protocol family (`inbound = "http" | "socks"` rule matcher).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Inbound {
     Http,
@@ -110,7 +110,7 @@ impl FromStr for Inbound {
 }
 
 /// A TOML value that may be written as a single item or as a list (`"a"` or `["a", "b"]`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OneOrMany<T> {
     One(T),
@@ -132,7 +132,7 @@ impl<T> OneOrMany<T> {
 pub type Target = OneOrMany<String>;
 
 /// One `port` matcher entry: a number (`443`) or an inclusive range string (`"8000-8080"`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PortSpec {
     Port(u16),
@@ -140,73 +140,94 @@ pub enum PortSpec {
 }
 
 /// `host_levels = { min = M, max = N }` matcher.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostLevels {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max: Option<u32>,
 }
 
 /// One `[[routing.rules]]` entry, as written in the file. Matching semantics live in the
 /// router; here every field is only parsed.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inbound: Option<Inbound>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_wildcard: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_regex: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cidr: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<OneOrMany<PortSpec>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_levels: Option<HostLevels>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bypass: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub weekday: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url_wildcard: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url_regex: Option<OneOrMany<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub keyword: Option<OneOrMany<String>>,
     /// Matches unconditionally (AirSwitch `TrueCondition`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub match_all: bool,
     /// Skips the rule (AirSwitch `FalseCondition`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
     /// Per-rule override of `[routing].resolve_dns`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resolve_dns: Option<bool>,
     /// Skip HTTPS MITM interception when this rule matches a `CONNECT` request (opaque tunnel
     /// instead). Off by default.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bypass_mitm: bool,
     pub target: Target,
 }
 
 /// `[routing.http]` / `[routing.socks]` split override table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingTableConfig {
     /// Fallback when no rule matches (if absent: `[routing].default` when `inherit`, else `direct`).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default: Option<Target>,
     /// Fall back to the unified `[routing]` table when no override rule matches.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherit: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleConfig>,
 }
 
 /// Unified `[routing]` table plus optional split overrides.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     #[serde(default = "default_target")]
     pub default: Target,
     /// Match hostnames against IP/CIDR rules via local DNS (off by default: no DNS leaks).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub resolve_dns: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<RuleConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub http: Option<RoutingTableConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub socks: Option<RoutingTableConfig>,
 }
 
@@ -255,7 +276,7 @@ impl RoutingConfig {
 }
 
 /// Upstream profile type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProfileType {
     Direct,
@@ -304,28 +325,40 @@ impl fmt::Display for ProfileType {
 }
 
 /// One `[profiles.<name>]` table.
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+///
+/// Serializing writes `password` as stored; callers that persist a config
+/// must not keep secrets inline.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     #[serde(rename = "type")]
     pub kind: ProfileType,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub password_file: Option<PathBuf>,
     /// Targets matching this list go `direct` instead (AirSwitch `bypassList`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bypass: Vec<String>,
     /// `https` only: skip upstream proxy certificate verification (default false).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tls_insecure_skip_verify: bool,
     /// `composite` only: profile used for `http://` traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub http_proxy: Option<String>,
     /// `composite` only: profile used for `https://` traffic.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub https_proxy: Option<String>,
     /// `composite` only: profile used for everything else.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_proxy: Option<String>,
 }
 
@@ -1468,5 +1501,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(d.rule.as_deref(), Some("custom"));
+    }
+
+    #[test]
+    fn serialize_round_trips_every_field() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct File {
+            #[serde(default)]
+            profiles: BTreeMap<String, ProfileConfig>,
+            routing: RoutingConfig,
+        }
+
+        let raw = r#"
+[profiles.corp]
+type = "https"
+host = "proxy.corp.local"
+port = 8443
+username = "alice"
+password_env = "CORP_PASS"
+bypass = ["localhost", "127.0.0.1"]
+tls_insecure_skip_verify = true
+
+[profiles.split]
+type = "composite"
+http_proxy = "corp"
+fallback_proxy = "direct"
+
+[routing]
+default = ["corp", "direct"]
+resolve_dns = true
+
+[[routing.rules]]
+name = "all-fields"
+inbound = "http"
+host = ["example.com", "example.org"]
+host_wildcard = "*.corp.local"
+host_regex = "^api\\."
+cidr = "10.0.0.0/8"
+ip = "127.0.0.1"
+port = [22, "8000-8080"]
+host_levels = { min = 1, max = 3 }
+bypass = "internal.local"
+weekday = ["mon", "fri"]
+time = "09:00-17:00"
+url_wildcard = "*://example.com/api/*"
+url_regex = "^https://example\\.com/"
+keyword = "secret"
+match_all = true
+disabled = true
+resolve_dns = true
+bypass_mitm = true
+target = "corp"
+
+[routing.http]
+inherit = true
+"#;
+
+        let parsed: File = toml::from_str(raw).unwrap();
+        let encoded = toml::to_string(&parsed).unwrap();
+        let reparsed: File = toml::from_str(&encoded).unwrap();
+        assert_eq!(parsed, reparsed);
+    }
+
+    #[test]
+    fn serialize_omits_defaults() {
+        let routing = RoutingConfig {
+            rules: vec![RuleConfig {
+                name: None,
+                inbound: None,
+                host: None,
+                host_wildcard: None,
+                host_regex: None,
+                cidr: None,
+                ip: None,
+                port: None,
+                host_levels: None,
+                bypass: None,
+                weekday: None,
+                time: None,
+                url_wildcard: None,
+                url_regex: None,
+                keyword: None,
+                match_all: false,
+                disabled: false,
+                resolve_dns: None,
+                bypass_mitm: false,
+                target: OneOrMany::One(PROFILE_DIRECT.to_string()),
+            }],
+            ..RoutingConfig::default()
+        };
+
+        let encoded = toml::to_string(&routing).unwrap();
+        assert!(encoded.contains("target = \"direct\""), "{encoded}");
+        for forbidden in [
+            "match_all",
+            "disabled",
+            "bypass_mitm",
+            "name",
+            "resolve_dns",
+            "http",
+            "socks",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "unexpected `{forbidden}` in:\n{encoded}"
+            );
+        }
     }
 }

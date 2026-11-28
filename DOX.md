@@ -218,7 +218,10 @@ When the owning doc lies inside a nested root, make the update there — but say
 `rusty-conduit-engine` is a library-only Rust crate (`rusty_conduit_engine`, BSD-3-Clause) holding the HTTP/HTTPS and SOCKS proxy engine, routing, upstream dialers, and optional HTTPS MITM shared by the rusty-conduit CLI family (`rusty-conduit`, `rusty-conduit-ssh`, `rusty-conduit-switch`, and `rusty-conduit-gui`). Open items: `docs/TODO.md`.
 
 - **Scope.** This repository only. Consumers live in sibling repositories; never edit them from here. Development happens on `main`.
-- **No CLI concerns.** No argument parsing, config-file loading, file watching, signal handling, or SSH process supervision. Do not add `clap`, `notify`, or a non-dev `toml` dependency. The CLIs deserialize their own config formats into the serde types in `src/routing.rs`.
+- **No CLI concerns in default builds.** No argument parsing, config-file loading, file watching, or SSH process supervision anywhere in the crate, and no CLI support at all unless a consumer opts in. Never add `clap`, `notify`, or a non-dev `toml` dependency. The CLIs deserialize their own config formats into the serde types in `src/routing.rs` (which also derive `Serialize`, omitting default-valued fields).
+- **Opt-in CLI support (`cli-support` feature, off by default).** Only behind this feature may the crate raise the open-file limit (`rlimit`), check paths before startup (`libc`), wait for shutdown signals (tokio `signal`), and define shared config-file section types (serde only, no file loading). Module: `src/cli_support/`.
+- **Opt-in test fixtures (`test-support` feature, off by default).** Helpers for consumers' tests (test CA, echo server, HTTP origin, TLS client, logger capture), built only from existing dependencies. Not covered by semver stability. Module: `src/test_support.rs`.
+- **Opt-in `.bak` importer (`import` feature, off by default; enables `routing`).** Converts AirSwitch / ZeroOmega / SwitchyOmega backups into routing config and renders commented TOML by hand (no `toml` dependency). Module: `src/import/`.
 - **Pure-Rust crypto.** TLS and certificates use `rustls` with the `ring` provider, plus `rcgen`, `x509-parser`, and `p12-keystore`. `openssl-sys` and `aws-lc-sys` must never enter the normal dependency graph on any target. `scripts/check-pure-rust-crypto.py` enforces this.
 - **Releases.** Tag `vX.Y.Z` with an annotated tag whose message body is the release notes (`git tag -a vX.Y.Z -F notes.md`). Pushing the tag runs `.github/workflows/release.yml`, which re-runs verification and creates the GitHub Release from that body. Follow the workspace's engine release order when one applies.
 - **`routing` cargo feature (default on).** It gates `regex`. Every module must still build and pass tests with `--no-default-features`. Regex-based conditions then fail to compile with an error that names the `routing` feature.
@@ -232,6 +235,8 @@ When the owning doc lies inside a nested root, make the update there — but say
   - `cargo clippy --all-targets --no-default-features --locked -- -D warnings`
   - `cargo test --locked`
   - `cargo test --no-default-features --locked`
+  - `cargo clippy --all-targets --all-features --locked -- -D warnings`
+  - `cargo test --all-features --locked`
   - `python3 scripts/check-pure-rust-crypto.py` (prints `PURE_RUST_CRYPTO_OK`)
 
 ## User Preferences
@@ -248,7 +253,7 @@ When the user requests a durable behavior change, record it here or in the relev
 - **HTTP/HTTPS proxy engine** — HTTP forward proxy, opaque `CONNECT` tunnel, the MITM interception path, and HTML error pages for proxy-generated errors. Start: `src/http/mod.rs`. Detail in ./src/http.
 - **SOCKS4/4a/5 proxy engine** — TCP `CONNECT` server with the relay-guard hook and SOCKS web blocking. Start: `src/socks/mod.rs`. Detail in ./src/socks.
 - **HTTPS MITM** — user-supplied CA loading, per-host leaf signing and caching, TLS interception of `CONNECT`. Start: `src/mitm/mod.rs`. Files: `src/http/mitm_tunnel.rs`, `tests/mitm_counters.rs`, `tests/mitm_h2_upstream_reconnect.rs`. Detail in ./src/mitm and ./src/http.
-- **Routing model and hot-reload snapshots** — serde routing/profile types, `RoutingInput`, compiled immutable `RoutingState`, and the lock-free `SharedRouting` (`arc-swap`) handle the engines read from. Start: `src/routing.rs`. Files: `src/router/`, `src/upstream/`.
+- **Routing model and hot-reload snapshots** — serde routing/profile types (`Deserialize` and `Serialize`, default-valued fields omitted), `RoutingInput`, compiled immutable `RoutingState`, and the lock-free `SharedRouting` (`arc-swap`) handle the engines read from. Start: `src/routing.rs`. Files: `src/router/`, `src/upstream/`.
 - **Rule matching and validation** — the Auto Switch `Router`, rule conditions, and configuration validation. Start: `src/router/mod.rs`. Detail in ./src/router.
 - **Upstream dialers and failover** — `direct`, `block`, `http`/`https`, `socks5`, `socks4a`, external dialers, `FailoverDialer`, `ProfileRegistry`. Start: `src/upstream/mod.rs`. Detail in ./src/upstream.
 - **Custom route resolver** — the `RouteResolver` trait lets embedders override routing decisions in the HTTP and SOCKS engines; `resolve_route_async` pre-resolves `resolve_dns` hostnames without blocking and passes them through `RouteResolver::resolve_with_ips`. Start: `src/routing.rs`. Files: `src/server.rs`, `tests/route_resolver.rs`.
@@ -258,6 +263,10 @@ When the user requests a durable behavior change, record it here or in the relev
 - **TCP dial and relay helpers** — OS-resolver dialing with timeouts and RFC 8305 Happy Eyeballs for multi-address hosts, TCP keepalive, `PrefixedStream` (read cursor, vectored writes), bidirectional relay with 32 KiB buffers. Start: `src/net.rs`.
 - **Logging and access records** — 6-level diagnostic logger with level-checked `log_*!` macros, text/JSON access logs encoded into one buffer per line (file sinks flushed whenever the writer queue drains, non-blocking `try_log_http` for `AccessGuard::drop`), and the structured `AccessRecord` sink for embedders. Start: `src/logging.rs`. Files: `src/http/mod.rs` (`AccessGuard`), `src/socks/mod.rs` (`Session`).
 - **`routing` cargo feature gate** — regex-based rule matching behind the default-on feature. Start: `Cargo.toml`. Files: `src/router/condition.rs`.
+- **Opt-in features** — `cli-support`, `test-support`, and `import` (all off by default; see the Project Contract). Start: `Cargo.toml`. Files: `src/lib.rs`, `src/cli_support/mod.rs`, `src/test_support.rs`, `src/import/mod.rs`.
+- **CLI support (`cli-support`)** — open-file limit raising (`fdlimit`), startup path preflight (`preflight`), `shutdown_signal`, the `app_version!` macro, and the shared `[mitm]` / `[logging]` config-file sections with their command-line merge (`file`: `FileMitmConfig`, `FileLoggingConfig`, `merge_mitm`, `merge_logging`, `FileValueError`). Start: `src/cli_support/mod.rs`. Files: `src/cli_support/fdlimit.rs`, `src/cli_support/preflight.rs`, `src/cli_support/file.rs`.
+- **Test fixtures (`test-support`)** — test CA (`test_ca`, `TestCa`, `FixedCert`), echo server, HTTP/TLS origin, TLS client, `connect_through`, logger and access-log capture for consumers' tests. Start: `src/test_support.rs`.
+- **`.bak` importer (`import`)** — converts AirSwitch / ZeroOmega / SwitchyOmega backups (`convert`) into profiles and rules, merges nested SwitchProfile conditions, and renders commented `rusty-conduit-switch` TOML (`render_toml`). Start: `src/import/mod.rs`. Files: `src/import/airswitch.rs`.
 - **Pure-Rust crypto policy check** — fails if `openssl-sys` or `aws-lc-sys` is in the dependency graph. Start: `scripts/check-pure-rust-crypto.py`. Files: `Cargo.toml`, `Cargo.lock`.
 - **Continuous integration** — format, clippy, no-default-features, crypto policy, and the test matrix on Linux, macOS, and Windows. Start: `.github/workflows/ci.yml`.
 - **Release** — on a `v*` tag, re-runs verification and creates the GitHub Release from the annotated tag's message body. Start: `.github/workflows/release.yml`.

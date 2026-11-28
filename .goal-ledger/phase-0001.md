@@ -1,26 +1,28 @@
-# phase-0001 — MITM bypass normalization, H2 stream caps/adaptive window, TLS session reuse, and host-scoped URL-rule check
+# phase-0001 — Serialize on routing config types
 
 - Status: done
 - Owner: executor
 - Depends on: none
-- Goal: Fix MITM bypass hostname normalization (`B-01`), cap MITM H2 concurrent streams (`B-06`) and enable adaptive H2 flow control (`P-10`), reuse MITM TLS server session storage/ticketer and pre-built upstream ALPN `ClientConfig`s (`P-05`), and scope MITM `per_request` downgrade to hosts that can actually match a URL rule (`P-10`).
-- Done when: every command in `## Verify` exits 0.
-- Pattern to follow: `src/filter.rs:325` (`normalize_domain`) and `src/http/mitm_tunnel.rs:621-634` (`should_bypass`)
+- Goal: Derive `Serialize` on every routing config type in `src/routing.rs`, omitting default-valued fields, so consumers can write the engine types back out instead of keeping their own copies.
+- Done when: every command in `## Verify` exits 0, including the new round-trip tests.
+- Pattern to follow: `../rusty-conduit-gui/crates/conduit-core/src/v2_model.rs:420-470` (the GUI's copy of `RoutingRule`, which already uses `#[serde(default, skip_serializing_if = "Option::is_none")]` on each optional field)
 
 ## Context
-`MitmInterceptor::should_bypass` strips only `[...]` brackets without lowercasing or stripping trailing dots, so `CONNECT Example.com:443` or `CONNECT example.com.:443` misses `--mitm-bypass-host`.
-In `src/http/mitm_tunnel.rs`, `server_http2::Builder` leaves `max_concurrent_streams` unbounded and omits `.adaptive_window(true)` (as does `client_http2::Builder`). Each MITM `CONNECT` builds a fresh `ServerConfig` with a new default 32-shard session cache and ticketer, breaking TLS session resumption, and `Dialer::connect` clones `ClientConfig` on every upstream dial just to set `alpn_protocols`.
-Finally, `state.router.has_url_rules(Inbound::Http)` forces every MITM `CONNECT` into HTTP/1.1 `per_request` mode even when the only URL rule is scoped to one specific host.
+M-02: the GUI keeps a duplicate routing AST only because the engine types are `Deserialize`-only. Output must be minimal TOML: absent `Option`s, `false` bools, and empty lists are not written, so a serialized config reads like a hand-written one and re-parses to an equal value.
+`ProfileType::External` is `#[serde(skip)]` (API-only); leave that attribute as is — serializing an `External` profile is an error, which is correct.
+`ProfileConfig` serializes `password` as stored. That is the caller's responsibility (the GUI never stores inline passwords); state it in the type's doc comment.
+The crate's `toml` is a dev-dependency only; use it in tests, never in non-test code.
 
 ## Scope
-- In: `src/http/mitm_tunnel.rs`, `src/router/mod.rs`, `src/router/condition.rs` (helper method on `RuleMatcher` if needed for host-scoped URL-rule check)
-- Out: `src/server.rs`, `src/net.rs`, `src/upstream/`, `src/mitm/cache.rs`, `src/logging.rs`, `docs/`
+- In: `src/routing.rs`
+- Out: `Cargo.toml`, `Cargo.lock`, `src/router/`, every other `src/` file, `DOX.md`
 
 ## Sub-tasks
-1. [done] In `src/http/mitm_tunnel.rs` (`MitmInterceptor::should_bypass`), normalize non-IP `trimmed` via `crate::filter::normalize_domain(trimmed)` before calling `matches_domain`. Add unit tests in `src/http/mitm_tunnel.rs` proving uppercase (`Example.COM`) and trailing-dot (`example.com.`) bypass rules match — done when: `cargo test --locked should_bypass` passes.
-2. [done] In `src/http/mitm_tunnel.rs`, add `const H2_MAX_CONCURRENT_STREAMS: u32 = 256;`, set `.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS)` and `.adaptive_window(true)` on `server_http2::Builder` in `serve_h2`, and set `.adaptive_window(true)` on `client_http2::Builder` in `h2_handshake` — done when: `grep -c 'max_concurrent_streams' src/http/mitm_tunnel.rs` is at least 1 and `grep -c 'adaptive_window(true)' src/http/mitm_tunnel.rs` is at least 2.
-3. [done] In `src/http/mitm_tunnel.rs`, store shared `session_storage: Arc<dyn rustls::server::StoresServerSessions>` (`rustls::server::ServerSessionMemoryCache::new(4096)`) and `ticketer: Option<Arc<dyn rustls::server::ProducesTickets>>` (`rustls::crypto::ring::Ticketer::new().ok()`) on `MitmInterceptor` and attach them to every `ServerConfig` built in `intercept`. Also pre-build the 4 ALPN variants of `Arc<ClientConfig>` (`[]`, `[http/1.1]`, `[h2]`, `[h2, http/1.1]`) once in `MitmInterceptor::new` (in a small `UpstreamTlsPool` struct cloned into `Dialer`) so `Dialer::connect` reuses a pre-built `Arc<ClientConfig>` without cloning `ClientConfig` on the common ALPN combinations — done when: `cargo test --locked mitm` passes.
-4. [done] In `src/router/condition.rs` (add `RuleMatcher::may_match_host_port(&self, host: &str, ip: Option<IpAddr>, port: u16) -> bool`) and `src/router/mod.rs`, add `pub fn host_may_match_url_rules(&self, inbound: Inbound, host: &str, port: u16) -> bool`: return `false` if `!self.has_url_rules(inbound)`; otherwise return `true` if any URL-bearing rule in the active table(s) for `inbound` has no disqualifying host/port constraint for `(normalize_host(host), port)` (conservatively return `true` for URL rules with no host/port constraint or with `cidr` + `resolve_dns`). Update `MitmInterceptor::intercept` (`src/http/mitm_tunnel.rs:709`) to call `state.router.host_may_match_url_rules(Inbound::Http, &target.host, target.port)`. Add unit tests in `src/router/mod.rs` covering host-scoped vs unscoped URL rules — done when: `cargo test --locked host_may_match_url_rules` passes.
+1. [done] In `src/routing.rs`, add `Serialize` next to `Deserialize` in the derives of `Inbound`, `OneOrMany`, `PortSpec`, `HostLevels`, `RuleConfig`, `RoutingTableConfig`, `RoutingConfig`, `ProfileType`, and `ProfileConfig`, and import it (`use serde::{Deserialize, Serialize};`) — done when: `cargo build --locked` and `cargo build --no-default-features --locked` succeed.
+2. [done] Add skip attributes, keeping every existing `#[serde(...)]` attribute: on each `Option<_>` field of `HostLevels`, `RuleConfig` (all except `target`), `RoutingTableConfig.default`, `RoutingConfig.http` / `.socks`, and `ProfileConfig` (all `Option` fields) add `skip_serializing_if = "Option::is_none"`; on the `bool` fields `RuleConfig.match_all`, `.disabled`, `.bypass_mitm`, `RoutingTableConfig.inherit`, `RoutingConfig.resolve_dns`, and `ProfileConfig.tls_insecure_skip_verify` add `skip_serializing_if = "std::ops::Not::not"`; on the `Vec` fields `RoutingTableConfig.rules`, `RoutingConfig.rules`, and `ProfileConfig.bypass` add `skip_serializing_if = "Vec::is_empty"`. Where a field already has `#[serde(default)]`, write `#[serde(default, skip_serializing_if = "...")]` — done when: `cargo clippy --all-targets --locked -- -D warnings` passes.
+3. [done] Add to `ProfileConfig`'s doc comment the sentence: `Serializing writes \`password\` as stored; callers that persist a config must not keep secrets inline.` — done when: `grep -c 'must not keep secrets inline' src/routing.rs` prints `1`.
+4. [done] In the existing `#[cfg(test)] mod tests` of `src/routing.rs`, add test `serialize_round_trips_every_field`: a TOML string with `[profiles.corp]` (type `https`, host, port, username, password_env, bypass, tls_insecure_skip_verify = true), `[profiles.split]` (type `composite`, http_proxy, fallback_proxy), and a `[routing]` with `default = ["corp", "direct"]`, `resolve_dns = true`, one rule setting every `RuleConfig` field (use `port = [22, "8000-8080"]`, `host_levels = { min = 1, max = 3 }`, `inbound = "http"`, `match_all = true`, `bypass_mitm = true`), plus `[routing.http]` with `inherit = true`; parse it into a test-local `#[derive(Debug, PartialEq, Serialize, Deserialize)] struct File { #[serde(default)] profiles: BTreeMap<String, ProfileConfig>, routing: RoutingConfig }` with `toml::from_str`, serialize with `toml::to_string`, parse again, and assert both values are equal — done when: `cargo test --locked serialize_round_trips_every_field` passes.
+5. [done] Add test `serialize_omits_defaults`: serialize a `RoutingConfig` holding one `RuleConfig` whose only set field is `target = "direct"` (all `Option`s `None`, bools `false`) and assert the output contains `target = "direct"` and none of `match_all`, `disabled`, `bypass_mitm`, `name`, `resolve_dns`, `http`, `socks` — done when: `cargo test --locked serialize_omits_defaults` passes.
 
 ## Verify
 ```sh
@@ -29,24 +31,32 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo clippy --all-targets --no-default-features --locked -- -D warnings
 cargo test --locked
 cargo test --no-default-features --locked
+python3 scripts/check-pure-rust-crypto.py
+git diff --exit-code -- Cargo.toml Cargo.lock src/router
 ```
 
 ## Escalate when
-- `rustls::crypto::ring::Ticketer` or `ServerSessionMemoryCache` is not available under the pinned `rustls` 0.23 feature set → stop, set Status: needs-human — reason: paste the compiler error.
-- Any existing MITM integration test (`tests/mitm_counters.rs`, `tests/mitm_h2_upstream_reconnect.rs`) fails unexpectedly → stop, set Status: needs-human — reason: paste the failing test output.
+- A derive fails because a field type does not implement `Serialize` (other than `ProfileType::External`, which stays skipped) → stop, set Status: needs-human — reason: name the type and field.
+- The round-trip test fails with unequal values → stop, set Status: needs-human — reason: paste the two values (do not change the test's TOML to make it pass).
+- An existing test fails → stop, set Status: needs-human — reason: name the test and paste the failure.
 
 ## Log
 - (append-only, one line per event)
-- sub-task 1: `should_bypass` normalizes non-IP hosts with `crate::filter::normalize_domain`; added test `should_bypass_normalizes_case_and_trailing_dot`
-- sub-task 2: added `H2_MAX_CONCURRENT_STREAMS = 256`; server H2 builder sets `max_concurrent_streams` + `adaptive_window(true)`, client H2 builder sets `adaptive_window(true)`
-- sub-task 3: `MitmInterceptor` holds shared `ServerSessionMemoryCache::new(4096)` + `ring::Ticketer::new().ok()` attached to every intercept `ServerConfig`; new `UpstreamTlsPool` pre-builds 4 ALPN `Arc<ClientConfig>` variants, cloned into `Dialer`, uncommon orders fall back to a fresh clone; added tests `upstream_tls_pool_reuses_common_alpn_configs`, `interceptor_shares_server_session_storage_and_ticketer`
-- sub-task 4: added `RuleMatcher::may_match_host_port` (condition.rs) and `Router::host_may_match_url_rules` (mod.rs, honours split tables + `inherit`); `MitmInterceptor::intercept` now uses it for `per_request`; added tests `host_may_match_url_rules_scopes_to_rule_hosts`, `host_may_match_url_rules_follows_active_tables`
-- ran `cargo fmt` to format the new tests, then the full `## Verify` block; all passed
+- sub-task 1: imported `serde::Serialize` and derived `Serialize` on all 9 routing config types in `src/routing.rs`
+- sub-task 2: added `skip_serializing_if` attributes on all `Option`, `bool`, and `Vec` fields of `HostLevels`, `RuleConfig`, `RoutingTableConfig`, `RoutingConfig`, and `ProfileConfig`
+- sub-task 3: added password-serialization warning sentence to `ProfileConfig` doc comment
+- sub-task 4: added `serialize_round_trips_every_field` unit test in `src/routing.rs`
+- sub-task 5: added `serialize_omits_defaults` unit test in `src/routing.rs`
+- verify: ran all `## Verify` commands; all exited 0
+
+- planner accepted phase-0001: re-ran ## Verify (225 default / 213 no-default tests, PURE_RUST_CRYPTO_OK), read the diff (in scope); wrapped the new ProfileConfig doc line to 100 columns (wrapped so the sub-task 3 phrase stays on one line)
 
 ## Evidence
 - (append-only: command → observed result)
-- `cargo test --locked should_bypass` → `test http::mitm_tunnel::tests::should_bypass_normalizes_case_and_trailing_dot ... ok` (1 passed)
-- `grep -c max_concurrent_streams src/http/mitm_tunnel.rs` → 1; `grep -c "adaptive_window(true)" src/http/mitm_tunnel.rs` → 2; `cargo check --locked` → Finished
-- `cargo test --locked mitm` → lib 43 passed, error_pages 2 passed, 4 passed (tests/mitm_*), 0 failed
-- `cargo test --locked host_may_match_url_rules` → 2 passed, 0 failed
-- `## Verify`: `cargo fmt --check` → exit 0; `cargo clippy --all-targets --locked -- -D warnings` → exit 0; `cargo clippy --all-targets --no-default-features --locked -- -D warnings` → exit 0; `cargo test --locked` → exit 0, 200 passed / 0 failed; `cargo test --no-default-features --locked` → exit 0, 188 passed / 0 failed
+- `cargo build --locked && cargo build --no-default-features --locked` → exit 0 (both builds succeeded)
+- `cargo clippy --all-targets --locked -- -D warnings` → exit 0 (no warnings)
+- `grep -c 'must not keep secrets inline' src/routing.rs` → `1`
+- `cargo test --locked serialize_round_trips_every_field` → exit 0 (1 passed; 0 failed)
+- `cargo test --locked serialize_omits_defaults` → exit 0 (1 passed; 0 failed)
+- `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py && git diff --exit-code -- Cargo.toml Cargo.lock src/router` → exit 0 (207+18 default tests passed, 196+17 no-default-features tests passed, `PURE_RUST_CRYPTO_OK`, out-of-scope files unchanged)
+- planner: `grep -c 'must not keep secrets inline' src/routing.rs` → 1 after the wrap

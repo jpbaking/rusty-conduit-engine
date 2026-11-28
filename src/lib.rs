@@ -27,6 +27,16 @@ pub mod server;
 pub mod socks;
 pub mod upstream;
 
+/// Support shared by the rusty-conduit CLIs (feature `cli-support`, off by default).
+#[cfg(feature = "cli-support")]
+pub mod cli_support;
+/// `.bak` importer for AirSwitch / ZeroOmega / SwitchyOmega backups (feature `import`).
+#[cfg(feature = "import")]
+pub mod import;
+/// Fixtures for consumers' tests (feature `test-support`, off by default).
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests {
     #[test]

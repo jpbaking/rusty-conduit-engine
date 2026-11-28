@@ -1,65 +1,71 @@
-# GOAL — Optimization roadmap Phase 2 for rusty-conduit-engine
+# GOAL — Engine v0.7.0 API: Serialize routing config, cli-support, test-support, and import features
 
 ## Goal
-- Goal ID: 20261128-engine-optimization-phase2
-- Outcome: `rusty-conduit-engine` fixes MITM bypass domain normalization, HTTP/1.1 slowloris header timeouts, MITM H2 stream caps, and `drain_timeout` task aborts (`B-01`, `B-06`), and lands `TCP_NODELAY`, async DNS routing, MITM TLS session/ALPN reuse, Happy Eyeballs dialing, passive upstream failover cooldown, fast-path logging, and data-plane/`CertCache` optimizations (`P-03`–`P-08`, `P-10`), with full Divergence Ledger and DOX updates.
-- Done when: `cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py` exits 0 and `docs/DIVERGENCE-LEDGER.md` and `DOX.md` document every observable change.
+- Goal ID: 20261128-engine-v070-api
+- Outcome: rusty-conduit-engine gains `Serialize` on its routing config types and three opt-in features — `cli-support` (fdlimit, preflight, shutdown signal, `app_version!`, shared `[mitm]`/`[logging]` file sections), `test-support` (shared TLS/echo/origin test fixtures), and `import` (the AirSwitch / SwitchyOmega `.bak` importer moved from rusty-conduit-switch, with the B-08 fixes) — so the four consumers can delete their copies in roadmap Phase 3b after one `v0.7.0` bump.
+- Done when: the Full verification command exits 0; with default features `cargo tree -e normal --target all --depth 1` lists neither `rlimit` nor `libc` as a direct engine dependency and `rlimit` appears nowhere (opt-in only); every phase `## Verify` passes; `docs/DIVERGENCE-LEDGER.md` has an entry for every behavior difference introduced (default constants, importer B-08 fixes); and `git diff <baseline>..HEAD` touches only paths under some phase's `Scope: In`.
 - Goal status: completed
 - Goal status meaning: drafting | approved | executing | blocked-on-human | in-review | awaiting-acceptance | completed | abandoned
-- Last completed phase: phase-0006
+- Last completed phase: phase-0007
 
 ## Execution
 - Execution mode: delegated
-- Planner tier: Antigravity CLI (Gemini 4 Neon Medium)
-- Executor tier: claude --model opus --effort medium via the herdr-subagent skill
-- Full verification: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && python3 scripts/check-pure-rust-crypto.py
+- Planner tier: Claude Code (claude-opus-5-5)
+- Executor tier: agy --model gemini-4-neon-medium via the herdr-subagent skill (fallback: claude --model opus --effort medium via herdr-subagent while agy is rate-limited)
+- Full verification: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings && cargo clippy --all-targets --no-default-features --locked -- -D warnings && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked && cargo test --no-default-features --locked && cargo test --all-features --locked && python3 scripts/check-pure-rust-crypto.py
 
 ## Git
 - Repository: yes
 - Strategy: isolated-branch
 - Starting branch: main
-- Work branch: goal/20261128-engine-optimization-phase2
-- Baseline commit: 2008ee84a5794009c4d73936cfbab7c545feb60b
-- Starting upstream at start: origin/main@2008ee84a5794009c4d73936cfbab7c545feb60b
+- Work branch: goal/20261128-engine-v070-api
+- Baseline commit: 39548ae9a86d50e2378481757f3fe0195e7f0f84
+- Starting upstream at start: origin/main@39548ae9a86d50e2378481757f3fe0195e7f0f84
 - Work upstream at start: none
 
 ## Phases
-- [done] phase-0001 — MITM bypass normalization, H2 stream caps/adaptive window, TLS session reuse, and host-scoped URL-rule check
-- [done] phase-0002 — Server TCP_NODELAY, HTTP/1.1 header-read timeout, and drain_timeout task abort
-- [done] phase-0003 — Happy Eyeballs dialing, 32 KiB relay, vectored writes, and PrefixedStream cursor
-- [done] phase-0004 — Async DNS resolution for resolve_dns routing rules and O(1) CertCache eviction
-- [done] phase-0005 — Passive upstream failover cooldown and single lazy-timeout dial wrapper
-- [done] phase-0006 — Fast-path logging, non-blocking AccessGuard::drop, single-buffer log encoding, and DOX/Divergence Ledger closeout
+- [done] phase-0001 — Serialize on routing config types
+- [done] phase-0002 — Contract amendment, opt-in features, and aligned default constants
+- [done] phase-0003 — cli-support: fdlimit, preflight, shutdown_signal, app_version!
+- [done] phase-0004 — cli-support: shared [mitm] and [logging] file sections
+- [done] phase-0005 — test-support: shared test fixtures
+- [done] phase-0006 — import: move the AirSwitch importer into the engine
+- [done] phase-0007 — import: B-08 fixes, divergence ledger, and docs
 
 ## Handoff
-- Current position: completed
+- Current position: completed; accepted by the user 2026-11-28; squashed into one commit and merged to main
 - Next role: planner
-- Next action: none
-- Last verified evidence: Full verification exited 0 (fmt, clippy default + no-default-features, cargo test 223 passed / no-default-features 211 passed, PURE_RUST_CRYPTO_OK)
+- Next action: none (v0.7.0 tag deferred by the user until the remaining optimizations land)
+- Last verified evidence: Gate D → Full verification exit 0 (225 / 213 / 265 tests, PURE_RUST_CRYPTO_OK)
 - Blockers: none
 
 ## Review
-- Reviewed by: Antigravity CLI (Gemini 4 Neon Medium), planner
-- Verification result: pass — cargo fmt --check, cargo clippy (default + --no-default-features, -D warnings), cargo test --locked (223 passed, 0 failed), cargo test --no-default-features --locked (211 passed, 0 failed), and python3 scripts/check-pure-rust-crypto.py (PURE_RUST_CRYPTO_OK) all exited 0
-- Diff reviewed: 2008ee84a5794009c4d73936cfbab7c545feb60b..c974b4e (29 files incl. ledger; zero scope drift; M-08..M-15 in docs/DIVERGENCE-LEDGER.md and DOX closeout verified)
-- Findings: none (branch is unpublished and clean; optional squash on acceptance is eligible)
+- Reviewed by: planner, Claude Code (claude-opus-5-5)
+- Verification result: pass — the Full verification command exits 0; `cargo tree -e normal --target all --depth 1` lists no `rlimit` / `libc` by default and `rlimit` appears nowhere in the default tree
+- Diff reviewed: 39548ae..5c7e94a — read in full for all planner- and executor-written code (routing Serialize, Cargo/CI/DOX/ledger, cli_support/mod.rs and file.rs, B-08 changes); the three verbatim copies (fdlimit.rs, preflight.rs, test_support.rs, import/airswitch.rs, import/mod.rs) were checked by `diff` against their sources (only `use` lines, module docs, removed CLI-only code, and new tests differ); 17 non-ledger paths, all within phase Scope: In; 18 Goal-ID commits, no merges or foreign commits
+- Findings: none open. Fixed during execution: a doc line wrap in phase-0001, the dependency-check command (libc is transitive by default) in phase-0002, the fidelity filter (rustfmt import order) in phase-0006. Intentional: the importer's rendered header still names rusty-conduit-switch (its output is a switch config). Deferred by plan: shared clap flag struct, ReverseProxy extraction, #[non_exhaustive], P-09 (v0.7.1), switch B-07/P-11
 
 ## Log
-- created ledger with 6 phases (replaces completed 20261126-listen-backlog ledger upon Gate A approval)
-- source plan: ../docs/OPTIMIZATION.md, roadmap Phase 2 (items B-01, B-06, P-03, P-04, P-05, P-06, P-07, P-08, P-10)
-- invariants preserved: zero hidden data/DNS/connection caches (CertCache remains sole cache), pure-Rust crypto only, --no-default-features must build and pass tests
-- Gate A/B/C approved by user on 2026-11-28; created goal/20261128-engine-optimization-phase2 from main at 2008ee84a5794009c4d73936cfbab7c545feb60b
-- delegated phase-0001 to claude --model opus --effort medium via herdr-subagent
-- phase-0001 done by executor (claude opus): B-01 bypass normalization, H2 stream cap/adaptive window, shared TLS session storage/ticketer + UpstreamTlsPool, host-scoped URL-rule check; Verify passed
-- planner verified phase-0001; delegated phase-0002 to claude --model opus --effort medium via herdr-subagent
-- phase-0002 done by executor (claude opus): server TCP_NODELAY, HTTP/1.1 header-read timeout (30s default, `with_header_read_timeout`), drain_timeout aborts remaining connection tasks; Verify passed after one fmt fix-up
-- planner verified phase-0002; delegated phase-0003 to claude --model opus --effort medium via herdr-subagent
-- phase-0003 done by executor (claude opus): Happy Eyeballs dialing via JoinSet (no new deps), 32 KiB relay buffers, vectored-write forwarding on PrefixedStream/UpstreamStream/CountingStream, PrefixedStream read cursor; Verify passed
-- planner verified phase-0003; delegated phase-0004 to claude --model opus --effort medium via herdr-subagent
-- phase-0004 done by executor (claude opus): Router::needs_dns/route_with_ips, RouteResolver::resolve_with_ips + resolve_route_async (tokio lookup_host bounded by connect_timeout, no cache) wired into HTTP/MITM/SOCKS, CertCache FIFO O(1) eviction; Verify passed
-- planner verified phase-0004; delegated phase-0005 to claude --model opus --effort medium via herdr-subagent
-- phase-0005 done by executor (claude opus): lazy `with_timeout` error context, passive per-profile failover cooldown (DEFAULT_FAILOVER_COOLDOWN 3 s, `ProfileRegistry::with_failover_cooldown`, CAS probe claim, clear on success); Verify passed
-- planner verified phase-0005; delegated phase-0006 to claude --model opus --effort medium via herdr-subagent
-- phase-0006 done by executor (claude opus): log_*! macros + Logger::log_fmt on hot paths, single-buffer visitor encoder (byte-identical), AccessLogger::try_log_http + non-blocking AccessGuard::drop, record skipped when access logging off (HTTP, MITM, SOCKS), Divergence Ledger M-08..M-15 and DOX closeout; Verify passed
-- planner Gate D review passed: Full verification exited 0 (223 default tests, 211 --no-default-features tests, PURE_RUST_CRYPTO_OK), 29 files reviewed with zero scope drift; set Goal status to awaiting-acceptance
-- user accepted goal on 2026-11-28 and chose squash + merge into main; soft-reset to baseline 2008ee84a5794009c4d73936cfbab7c545feb60b, created single squashed commit retaining .goal-ledger/, and fast-forwarded main
+- created ledger with 7 phases; replaces the completed ledger 20261128-engine-optimization-phase2 (kept in Git history)
+- source plan: rusty-conduit-series/docs/OPTIMIZATION.md roadmap Phase 3 engine items M-01 and M-02 (incl. B-08); P-09 is a separate later goal and tag (v0.7.1) — user decision "API first, P-09 later" (2026-11-28)
+- planner decisions (scope): no `clap` or `toml` in the engine — `cli-support` needs only `rlimit`, `libc`, and tokio `signal`; the shared clap flag struct and `ReverseProxy` extraction are deferred (per-CLI env prefixes, ssh help-text variants, switch deprecated aliases, and consumer-config coupling need their own design); ssh's duplicate SOCKS5 client needs no engine change (`upstream::socks5::{handshake, encode_connect_request}` are already public) and is Phase 3b consumer work; `#[non_exhaustive]` on engine option structs is deferred (it would break every consumer's struct literals at the bump)
+- planner decisions (design): `app_version!` is a `macro_rules!` because `option_env!`/`env!("CARGO_PKG_VERSION")` must expand in the consumer crate; shared file sections are named-table structs (`[mitm]`, `[logging]`) because `deny_unknown_fields` cannot be combined with `serde(flatten)`; the importer keeps hand-rendered TOML (no `toml` dependency)
+- known Phase 3b concern (not this goal): conduit-core's `RoutingRule` has no `deny_unknown_fields` while the engine's `RuleConfig` does; adopting the engine types in the GUI needs a check against persisted data
+- user approved the goal as drafted (Gate A), the isolated branch (Gate B), and execution (Gate C) on 2026-11-28 in one reply
+- Gate B: branch goal/20261128-engine-v070-api created from main at baseline 39548ae9a86d50e2378481757f3fe0195e7f0f84
+- delegated phase-0001 to agy (herdr-subagent)
+- phase-0001 completed: derived `Serialize` with `skip_serializing_if` on all routing config types in `src/routing.rs`, documented password serialization, added round-trip and default-omission tests; all verify checks passed
+- planner accepted phase-0001 (Verify re-run, diff in scope, doc line wrapped); began phase-0002
+- phase-0002 done (planner): contract amendment, opt-in features, constants (M-16), CI --all-features
+- delegated phase-0003 to agy (herdr-subagent)
+- phase-0003 completed: copied `fdlimit.rs` and `preflight.rs`, added `shutdown_signal` and `app_version!` macro with unit test in `src/cli_support/`; all verify checks passed
+- planner accepted phase-0003; began phase-0004
+- phase-0004 done (planner): shared [mitm]/[logging] sections and merge helpers; two divergence candidates logged for phase-0007
+- delegated phase-0005 to agy (herdr-subagent)
+- phase-0005 completed: published shared test fixtures in `src/test_support.rs` behind `test-support` with `fixtures_work` smoke test; all verify checks passed
+- planner accepted phase-0005; delegated phase-0006 to agy (herdr-subagent)
+- phase-0006 blocked (needs-human): `cargo fmt --check` and `## Verify` line 31 copy-fidelity diff conflict on `src/import/airswitch.rs` (`use crate::router::{BypassList, RuleMatcher};` reordered before `use crate::routing::{...}` by rustfmt)
+- planner answered phase-0006 escalation (rustfmt import order vs the fidelity filter); phase-0006 closed by the planner
+- phase-0007 done (planner): B-08 fixes, M-17/M-18, docs; status in-review
+- Gate D passed; status awaiting-acceptance
+- user accepted 2026-11-28 and chose squash; all squash checks passed (clean tree, on the work branch, every commit carries the Goal-ID, no merges, nothing reachable from origin, origin/main still at the baseline); squashed onto the baseline, merged to main, pushed; no v0.7.0 tag yet (user: finish all optimizations first)

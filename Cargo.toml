@@ -12,6 +12,13 @@ path = "src/lib.rs"
 [features]
 default = ["routing"]
 routing = ["dep:regex"]
+# Opt-in support shared by the CLIs: open-file limit, startup path preflight, shutdown signal,
+# shared config-file sections. Off by default so embedders stay free of CLI concerns.
+cli-support = ["dep:rlimit", "dep:libc", "tokio/signal"]
+# Opt-in fixtures for consumers' tests (existing dependencies only).
+test-support = []
+# Opt-in AirSwitch / ZeroOmega / SwitchyOmega `.bak` importer (validates regex rules).
+import = ["routing"]
 
 [dependencies]
 # Async runtime & utilities
@@ -58,6 +65,11 @@ time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
 
 # Errors
 thiserror = "2"
+
+# `cli-support` only: raise RLIMIT_NOFILE and check path writability before startup.
+[target.'cfg(unix)'.dependencies]
+rlimit = { version = "0.12", optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # `all` exposes the keepalive getters used to verify socket options in tests.

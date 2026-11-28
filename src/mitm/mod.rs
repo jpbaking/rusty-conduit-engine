@@ -34,7 +34,7 @@ pub const DEFAULT_MITM_CERT_TTL: Duration = Duration::from_secs(60 * 60);
 /// Minimum accepted MITM leaf certificate lifetime.
 pub const MIN_MITM_CERT_TTL: Duration = Duration::from_secs(10);
 /// Default maximum number of cached MITM leaf certificates.
-pub const DEFAULT_MITM_CERT_CACHE_MAX: usize = 4096;
+pub const DEFAULT_MITM_CERT_CACHE_MAX: usize = 10_240;
 
 /// Where the MITM CA comes from (only present when MITM mode is ON).
 #[derive(Debug, Clone, PartialEq, Eq)]
